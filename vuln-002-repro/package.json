@@ -1,0 +1,11 @@
+{
+  "name": "vuln-002-path-traversal-repro",
+  "version": "1.0.0",
+  "description": "Standalone reproduction of VULN-002: Path Traversal in amplify-storage-simulator",
+  "private": true,
+  "dependencies": {
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "fs-extra": "^8.1.0"
+  }
+}
