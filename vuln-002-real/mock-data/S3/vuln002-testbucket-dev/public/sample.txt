@@ -1,0 +1,1 @@
+This is a legitimate S3 object inside the mock bucket.
