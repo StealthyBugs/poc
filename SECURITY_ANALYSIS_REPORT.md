@@ -488,6 +488,82 @@ const createHTML = (redirectTarget: string) => {
 
 ---
 
+### [VULN-009] DOM XSS via Unsanitized GeoJSON Properties in Map Popup
+
+**Severity:** High
+**CVSS v3.1 Score:** 7.1
+**Vector:** AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N
+**Repository:** aws-amplify/maplibre-gl-js-amplify
+**File:** src/popupRender.ts
+**Line(s):** 22-43
+**Related File:** src/drawUnclusteredLayer.ts (line 90)
+**Vulnerability Class:** DOM XSS
+**Authentication Required:** Depends on data source (GeoJSON origin)
+
+---
+
+**Vulnerable Code:**
+```typescript
+// popupRender.ts lines 22-43
+if (strHasLength(selectedFeature.properties.place_name)) {
+  const placeName = selectedFeature.properties.place_name.split(',');
+  title = placeName[0];
+  address = placeName.splice(1, placeName.length).join(',');
+} else if (
+  strHasLength(selectedFeature.properties.title) ||
+  strHasLength(selectedFeature.properties.address)
+) {
+  title = selectedFeature.properties.title;
+  address = selectedFeature.properties.address;
+}
+
+const titleHtml = `<div ...>${title}</div>`;
+const addressHtml = `<div ...>${address}</div>`;
+
+// drawUnclusteredLayer.ts line 90
+const popup = new Popup()
+  .setLngLat(coordinates as Coordinates)
+  .setHTML(popupRender(selectedFeature));  // Unsanitized HTML injected
+```
+
+**Why This Is Exploitable:**
+GeoJSON feature properties (`title`, `address`, `place_name`) are interpolated directly into HTML strings without any escaping, then passed to MapLibre's `.setHTML()`. Unlike the geofence ID issue (VULN-001), these properties have **no server-side validation restricting HTML characters**. If GeoJSON data originates from untrusted sources (user-submitted locations, third-party APIs, or data loaded from URLs), arbitrary JavaScript execution is possible when a user clicks a map marker.
+
+**Exploitability Gate Assessment:**
+- **Gate 1 (Reachability):** Code runs client-side when user clicks a map point. ✅
+- **Gate 2 (Input Control):** GeoJSON properties come from the data source — attacker-controlled if data is user-submitted or from third-party APIs. ✅
+- **Gate 3 (Bypass Check):** No HTML escaping or sanitization exists in popupRender.ts. ✅
+- **Gate 4 (Preconditions):** Application must use `drawUnclusteredLayer` with untrusted GeoJSON data. ⚠️
+- **Gate 5 (Impact):** JavaScript execution in victim's browser. ✅
+- **Gate 6 (HTTP PoC):** ✅
+
+**Exploitation Payload:**
+```json
+{
+  "type": "Feature",
+  "geometry": {"type": "Point", "coordinates": [-73.9, 40.7]},
+  "properties": {
+    "title": "<img src=x onerror=alert(document.cookie)>",
+    "address": "123 Main St"
+  }
+}
+```
+
+When a user clicks the map marker for this feature, the `onerror` handler executes JavaScript.
+
+**VERDICT: PASSES ALL GATES when GeoJSON data originates from untrusted sources. Unlike VULN-001, no server-side validation prevents HTML in these properties.**
+
+**Remediation:**
+```typescript
+const escapeHtml = (str: string) => str.replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const titleHtml = `<div ...>${escapeHtml(title)}</div>`;
+const addressHtml = `<div ...>${escapeHtml(address)}</div>`;
+```
+
+---
+
 ## Patterns Analyzed but Not Vulnerable
 
 ### Properly Secured Patterns Found
