@@ -11,7 +11,9 @@
 
 A comprehensive static source code security analysis was performed across all public repositories in the `aws-amplify` GitHub organization. The analysis covered 10 repositories including amplify-js, amplify-cli, amplify-backend, amplify-category-api, amplify-hosting, amplify-ui, amplify-codegen, amplify-data, discord-bot, and maplibre-gl-js-amplify.
 
-**Critical Finding:** An authorization bypass vulnerability (VULN-003) was identified in the **generated admin auth Lambda code** (`admin-auth-app.js`) that is deployed to production. A missing `return` statement in the `checkGroup` middleware allows any authenticated Cognito user to bypass group-based authorization and perform admin operations (addUserToGroup, disableUser, enableUser, etc.). Combined with CORS wildcard (`Access-Control-Allow-Origin: *`), this is exploitable cross-origin. This is the highest-priority finding.
+**Confirmed Finding (VULN-002):** A path traversal vulnerability in `amplify-storage-simulator` was **confirmed exploitable against the real compiled code**. Using the `prefix` query parameter with `../` sequences, an attacker can enumerate files and directories anywhere on the developer's filesystem when `amplify mock storage` is running. This was demonstrated by building the actual TypeScript package from source and running the real `AmplifyStorageSimulator` class — the traversal allows listing files multiple directory levels above the mock data directory, including project source code and potentially credentials.
+
+**Real but Limited Finding (VULN-003):** An authorization bypass exists in the generated admin auth Lambda (`admin-auth-app.js`) due to a missing `return` after `next(err)` in Express middleware. This is a genuine code bug, but it **only affects Amplify Gen 1 instances** that explicitly enabled Admin Queries during `amplify add auth` manual configuration. It does **not** affect Gen 2 (console-created) instances, which use a completely different architecture.
 
 **Overall Assessment:** The aws-amplify codebase demonstrates strong security practices overall. The team uses parameterized queries (Prisma ORM, DynamoDB expression attributes), proper HMAC webhook verification, OAuth state validation with PKCE, and secure cookie handling (httpOnly, sameSite strict). Most other identified issues are in local development simulators or involve patterns mitigated by other controls.
 
@@ -148,19 +150,43 @@ The `prefix` query parameter is attacker-controlled and directly concatenated in
 - **Gate 5 (Impact):** Arbitrary file read on the developer's machine. ✅
 - **Gate 6 (HTTP PoC):** ✅
 
-**HTTP Proof of Concept:**
+**HTTP Proof of Concept (CONFIRMED against real compiled code):**
+
+The following was tested against the actual `AmplifyStorageSimulator` class built from the amplify-cli source TypeScript:
+
 ```http
-GET /<bucket-name>/....//....//....//....//etc/passwd?prefix=....//....//....//....//etc HTTP/1.1
+GET /vuln002-testbucket-dev/?prefix=../../../../.. HTTP/1.1
 Host: localhost:20005
 ```
 
-**Expected Response / Impact Indicator:**
-Contents of /etc/passwd or other sensitive files on the developer's machine.
+**Confirmed Response (truncated):**
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<ListBucketResult>
+  <Contents>
+    <Key>./../../../../SECURITY_ANALYSIS_REPORT.md</Key>
+    <LastModified>2026-03-05T22:15:42.000Z</LastModified>
+    <Size>29334</Size>
+  </Contents>
+  <Contents>
+    <Key>./../../../../vuln-002-repro/server.js</Key>
+    <LastModified>2026-03-05T22:32:38.000Z</LastModified>
+    <Size>6030</Size>
+  </Contents>
+  <!-- Files from 4 directory levels above the mock data directory -->
+</ListBucketResult>
+```
+
+**Confirmed traversal depths:**
+- `prefix=../..` — escapes 1 level (lists S3 parent directory)
+- `prefix=../../..` — escapes 2 levels (lists mock-data directory)
+- `prefix=../../../../..` — escapes 4 levels (lists entire project directory)
+- `prefix=../../../../../../../../` — reaches filesystem root (crashes on permission-restricted files)
 
 **Impact:**
-Arbitrary file read on any machine running `amplify mock storage`. Could expose SSH keys, AWS credentials (~/.aws/credentials), application source code, and other sensitive files. While this is a local development tool, developers often run it on machines with access to production credentials.
+Directory enumeration and file metadata disclosure (names, sizes, timestamps) anywhere on the developer's machine when `amplify mock storage` is running. The simulator binds to all interfaces by default, making it accessible on the local network.
 
-**VERDICT: PASSES ALL GATES for the scenario where the storage simulator is running and network-accessible. However, the scope is limited to development environments, not production deployments.**
+**VERDICT: CONFIRMED EXPLOITABLE against real compiled code. Scope is limited to development environments where `amplify mock storage` is running.**
 
 **Remediation:**
 ```typescript
@@ -174,10 +200,10 @@ if (!resolvedPath.startsWith(path.resolve(this.localDirectoryPath))) {
 
 ---
 
-### [VULN-003] Authorization Bypass via Missing Return in Generated Admin Auth Middleware (CRITICAL — PRODUCTION CODE)
+### [VULN-003] Authorization Bypass via Missing Return in Generated Admin Auth Middleware (Gen 1 Only)
 
-**Severity:** Critical
-**CVSS v3.1 Score:** 8.8
+**Severity:** High (downgraded from Critical — limited applicability)
+**CVSS v3.1 Score:** 8.8 (if applicable)
 **Vector:** AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H
 **Repository:** aws-amplify/amplify-cli
 **File:** packages/amplify-category-auth/resources/adminAuth/admin-auth-app.js
@@ -242,11 +268,18 @@ HTTP/1.1 200 OK
 ```
 The attacker user is now a member of the Admin group.
 
-**Impact:**
+**Impact (when applicable):**
 - **Privilege Escalation:** Any authenticated user can add themselves (or others) to any Cognito group including admin groups
 - **Account Takeover:** Attacker can disable other users' accounts via `/disableUser`
 - **User Pool Manipulation:** Full control over user management (list users, confirm signups, modify groups)
-- **Cross-Origin Exploitation:** Combined with CORS `Access-Control-Allow-Origin: *` (line 39), a malicious website can exploit this if the victim has an active session
+
+**Applicability Constraints:**
+- **Gen 1 only:** This code is deployed via `amplify add auth` → Manual Configuration → "Do you want to add an admin queries API?" → Yes. Amplify Gen 2 (console-created instances) uses a completely different architecture and does NOT deploy this Lambda.
+- **`process.env.GROUP` must be set to a real group name.** If GROUP is `undefined` or `'NONE'`, the middleware short-circuits at line 52-54 (`return next()`) — everyone passes, and the bug is never reached.
+- **Attacker needs a valid Cognito JWT.** API Gateway has a `cognito_user_pools` authorizer; anonymous requests are rejected before reaching the Lambda.
+- **AdminQueries API must exist.** This is an optional feature, not enabled by default.
+
+**Express Behavior Detail:** When `next(err)` is called (line 61), Express synchronously invokes the error handler, which sends a 403 response. Then `next()` at line 68 is called, which invokes the route handler. The route handler executes the Cognito admin operation (e.g., `AdminAddUserToGroupCommand`) — the operation succeeds server-side even though the HTTP response was already sent as 403. The attacker gets a 403 back, but the admin action executes regardless.
 
 **Remediation:**
 ```javascript
