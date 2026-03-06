@@ -13,7 +13,7 @@ A comprehensive static source code security analysis was performed across all pu
 
 **Confirmed Finding (VULN-002):** A path traversal vulnerability in `amplify-storage-simulator` was **confirmed exploitable against the real compiled code**. Using the `prefix` query parameter with `../` sequences, an attacker can enumerate files and directories anywhere on the developer's filesystem when `amplify mock storage` is running. This was demonstrated by building the actual TypeScript package from source and running the real `AmplifyStorageSimulator` class — the traversal allows listing files multiple directory levels above the mock data directory, including project source code and potentially credentials.
 
-**Real but Limited Finding (VULN-003):** An authorization bypass exists in the generated admin auth Lambda (`admin-auth-app.js`) due to a missing `return` after `next(err)` in Express middleware. This is a genuine code bug, but it **only affects Amplify Gen 1 instances** that explicitly enabled Admin Queries during `amplify add auth` manual configuration. It does **not** affect Gen 2 (console-created) instances, which use a completely different architecture.
+**Retracted Finding (VULN-003):** An authorization bypass was initially theorized in the generated admin auth Lambda (`admin-auth-app.js`) due to a missing `return` after `next(err)`. **This was tested against a live AWS Gen 1 deployment and confirmed NOT exploitable.** Express's internal layer processing skips route handlers when advancing to the error handler, and the subsequent `next()` call cannot revisit them. The missing `return` is a code quality issue only.
 
 **Overall Assessment:** The aws-amplify codebase demonstrates strong security practices overall. The team uses parameterized queries (Prisma ORM, DynamoDB expression attributes), proper HMAC webhook verification, OAuth state validation with PKCE, and secure cookie handling (httpOnly, sameSite strict). Most other identified issues are in local development simulators or involve patterns mitigated by other controls.
 
@@ -200,109 +200,62 @@ if (!resolvedPath.startsWith(path.resolve(this.localDirectoryPath))) {
 
 ---
 
-### [VULN-003] Authorization Bypass via Missing Return in Generated Admin Auth Middleware (Gen 1 Only)
+### [VULN-003] Missing Return After next(err) in Generated Admin Auth Middleware — NOT EXPLOITABLE
 
-**Severity:** High (downgraded from Critical — limited applicability)
-**CVSS v3.1 Score:** 8.8 (if applicable)
-**Vector:** AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H
+**Severity:** Low (code quality issue only — NOT a security vulnerability)
 **Repository:** aws-amplify/amplify-cli
 **File:** packages/amplify-category-auth/resources/adminAuth/admin-auth-app.js
 **Line(s):** 47-69
-**Vulnerability Class:** Authorization Bypass / Privilege Escalation
-**Authentication Required:** Any authenticated Cognito user
+**Vulnerability Class:** Code Quality / Express Anti-Pattern
+**Authentication Required:** N/A — not exploitable
 
 ---
 
-**Vulnerable Code:**
+**Code Pattern:**
 ```javascript
 const checkGroup = function (req, res, next) {
-  if (req.path == '/signUserOut') {
-    return next();
-  }
-
-  if (typeof allowedGroup === 'undefined' || allowedGroup === 'NONE') {
-    return next();
-  }
-
-  // Fail if group enforcement is being used
+  // ...
   if (req.apiGateway.event.requestContext.authorizer.claims['cognito:groups']) {
     const groups = req.apiGateway.event.requestContext.authorizer.claims['cognito:groups'].split(',');
     if (!(allowedGroup && groups.indexOf(allowedGroup) > -1)) {
       const err = new Error(`User does not have permissions to perform administrative tasks`);
-      next(err);       // <-- BUG: no return! Execution falls through to line 68
+      next(err);       // Missing return — but NOT exploitable
     }
   } else {
     const err = new Error(`User does not have permissions to perform administrative tasks`);
     err.statusCode = 403;
-    next(err);         // <-- BUG: no return! Execution falls through to line 68
+    next(err);         // Missing return — but NOT exploitable
   }
-  next();              // <-- Line 68: ALWAYS called, bypassing the authorization error
+  next();              // Called after next(err), but route handler is NOT reached
 };
 ```
 
-**Why This Is Exploitable:**
-When a user fails the group check (lines 59-62: user has groups but not the required one) or has no groups at all (lines 63-67), `next(err)` is called to trigger the error handler. However, **there is no `return` statement after `next(err)`**, so execution falls through to line 68 where `next()` is called without an error argument. In Express, calling `next()` (without error) after `next(err)` causes the request to proceed to the next route handler, effectively **bypassing the authorization check entirely**. The admin operations (addUserToGroup, removeUserFromGroup, disableUser, enableUser, etc.) execute regardless of the user's group membership.
+**Why This Is NOT Exploitable (TESTED AGAINST LIVE AWS DEPLOYMENT):**
 
-**Attack Path:**
-1. Attacker registers a regular Cognito user account (no admin group membership)
-2. Attacker authenticates and obtains a valid Cognito JWT
-3. Attacker sends POST request to `/addUserToGroup` with their own username and the admin group
-4. The `checkGroup` middleware calls `next(err)` but falls through to `next()`, bypassing authorization
-5. The route handler executes `addUserToGroup`, granting the attacker admin privileges
-6. Attacker now has full admin access to the Cognito User Pool
+A Gen 1 Amplify instance was deployed with Admin Queries enabled and group restriction set. An authenticated Cognito user (not in the restricted group) sent a POST to `/addUserToGroup`:
 
-**HTTP Proof of Concept:**
-```http
-POST /addUserToGroup HTTP/1.1
-Host: <api-gateway-id>.execute-api.<region>.amazonaws.com
-Content-Type: application/json
-Authorization: <valid-cognito-jwt-for-non-admin-user>
-
-{"username": "attacker-username", "groupname": "Admin"}
+```
+HTTP/2 403
+{"message":"User does not have permissions to perform administrative tasks"}
 ```
 
-**Expected Response / Impact Indicator:**
-```json
-HTTP/1.1 200 OK
-{"message": "Success"}
-```
-The attacker user is now a member of the Admin group.
+**Verification:** The user was NOT added to the group. The Cognito operation did NOT execute server-side.
 
-**Impact (when applicable):**
-- **Privilege Escalation:** Any authenticated user can add themselves (or others) to any Cognito group including admin groups
-- **Account Takeover:** Attacker can disable other users' accounts via `/disableUser`
-- **User Pool Manipulation:** Full control over user management (list users, confirm signups, modify groups)
+**Why the bypass theory was wrong:**
 
-**Applicability Constraints:**
-- **Gen 1 only:** This code is deployed via `amplify add auth` → Manual Configuration → "Do you want to add an admin queries API?" → Yes. Amplify Gen 2 (console-created instances) uses a completely different architecture and does NOT deploy this Lambda.
-- **`process.env.GROUP` must be set to a real group name.** If GROUP is `undefined` or `'NONE'`, the middleware short-circuits at line 52-54 (`return next()`) — everyone passes, and the bug is never reached.
-- **Attacker needs a valid Cognito JWT.** API Gateway has a `cognito_user_pools` authorizer; anonymous requests are rejected before reaching the Lambda.
-- **AdminQueries API must exist.** This is an optional feature, not enabled by default.
+Express's router processes layers sequentially using an internal `idx` counter:
 
-**Express Behavior Detail:** When `next(err)` is called (line 61), Express synchronously invokes the error handler, which sends a 403 response. Then `next()` at line 68 is called, which invokes the route handler. The route handler executes the Cognito admin operation (e.g., `AdminAddUserToGroupCommand`) — the operation succeeds server-side even though the HTTP response was already sent as 403. The attacker gets a 403 back, but the admin action executes regardless.
+1. `checkGroup` calls `next(err)` → Express advances `idx`, **skipping** the route handler (`/addUserToGroup` — not an error handler), and finds the error handler (4-param function) → error handler sends 403 → returns
+2. `checkGroup` calls `next()` → Express continues from the current `idx` position, which is now **past** both the route handler and error handler → no more layers → request ends
 
-**Remediation:**
+The route handler is skipped during step 1 (Express skips non-error handlers when `layerError` is set) and is never revisited in step 2 because `idx` has already advanced past it. The second `next()` call is effectively a no-op.
+
+**VERDICT: FALSE POSITIVE. The missing `return` is a code quality issue (violates Express best practices — calling `next()` multiple times from the same middleware), but it does NOT cause authorization bypass. The authorization check works correctly. Tested and verified against a live AWS deployment.**
+
+**Recommendation (code quality only):**
+Add `return` before `next(err)` to follow Express best practices and prevent double `next()` calls, even though the current behavior is safe:
 ```javascript
-const checkGroup = function (req, res, next) {
-  if (req.path == '/signUserOut') {
-    return next();
-  }
-  if (typeof allowedGroup === 'undefined' || allowedGroup === 'NONE') {
-    return next();
-  }
-  if (req.apiGateway.event.requestContext.authorizer.claims['cognito:groups']) {
-    const groups = req.apiGateway.event.requestContext.authorizer.claims['cognito:groups'].split(',');
-    if (!(allowedGroup && groups.indexOf(allowedGroup) > -1)) {
-      const err = new Error('User does not have permissions to perform administrative tasks');
-      err.statusCode = 403;
-      return next(err);  // FIX: Add return
-    }
-  } else {
-    const err = new Error('User does not have permissions to perform administrative tasks');
-    err.statusCode = 403;
-    return next(err);    // FIX: Add return
-  }
-  next();
+      return next(err);  // Best practice: always return after next(err)
 };
 ```
 
