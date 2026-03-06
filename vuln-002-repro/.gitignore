@@ -1,2 +1,4 @@
 node_modules/
 fake-s3-bucket/
+outside-secret/
+parent-secret.txt
