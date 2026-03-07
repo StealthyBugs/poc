@@ -8,9 +8,9 @@
 
 This report contains the results of a static-analysis security audit of 45 public repositories in the Capital One GitHub organization. Analysis focused exclusively on high and critical vulnerabilities reachable through HTTP requests and normal application interaction.
 
-**Total confirmed vulnerabilities: 26**
+**Total confirmed vulnerabilities: 28**
 - Critical: 3
-- High: 14
+- High: 16
 - Medium-High: 9
 
 Each finding below survived multiple rounds of false-positive review, including verification that the code is not dead/test/mock, that no upstream guards neutralize the issue, and that a realistic attack path exists.
@@ -552,6 +552,54 @@ value = value
 **Exploitation:** A repo admin sends `POST /api/repos/:owner/:repo` with `Host: attacker.com` (or `X-Forwarded-For: attacker.com`). The system registers a GitHub webhook pointing to `https://attacker.com/hook?access_token=<signed_token>`. GitHub then sends all repo events (including PR reviews, code pushes) to the attacker's server, along with the signed access token — which can be reused to forge webhook events via VULN-09.
 
 **Not a false positive because:** The `GetHost` function's fallback chain through untrusted headers is explicit in the source code. The signed token is concatenated directly into the URL registered with GitHub. This chains with VULN-09 (missing signature verification) for full compromise of the code review system.
+
+---
+
+### VULN-27: SQL Injection via String Formatting in Teradata Client Library
+- **Severity:** HIGH
+- **Repository:** giraffez
+- **Files:**
+  - `giraffez/cmd.py:329,335,351` — `exists()` and `fetch_columns()`
+  - `giraffez/export.py:133` — auto-wrapping non-SELECT statements
+  - `giraffez/load.py:298` — error table queries
+  - `giraffez/commandline.py:443` — CLI error table query
+- **Functions:** `TeradataCmd.exists()`, `TeradataCmd.fetch_columns()`, `TeradataExport.from_table()`
+- **Vulnerability Type:** SQL Injection (CWE-89)
+
+**Taint Flow:**
+1. Entry: `object_name`/`table_name` parameter passed to library methods
+2. Values formatted directly into SQL without parameterization:
+   - `self.execute("show table {}".format(object_name))` (line 329)
+   - `self.execute("show view {}".format(object_name))` (line 335)
+   - `self.execute("select top 1 * from {}".format(table_name))` (line 351)
+   - `statement = "select * from {}".format(statement)` (export.py:133)
+3. `execute()` calls `prepare_statement()` which handles comments/newlines but does not parameterize identifiers
+
+**Why protections fail:** No parameterization, identifier quoting, or allowlist validation exists. The `escape_quotes` function in `fmt.py` only handles single quotes within values, not identifier injection.
+
+**Exploitation:** Any application using giraffez as a library with user-controlled table names is vulnerable: `cmd.exists("mydb; DROP TABLE sensitive_data; --")` executes arbitrary SQL on Teradata.
+
+**Not a false positive because:** These are core public API methods in production library code. The library is designed for programmatic use where table names may originate from user input in ETL pipelines or web applications.
+
+---
+
+### VULN-28: Command Injection via `subprocess.call` with `shell=True`
+- **Severity:** HIGH
+- **Repository:** giraffez
+- **File:** `giraffez/commandline.py:270-285`
+- **Function:** `ExternalCommand.run()`
+- **Vulnerability Type:** OS Command Injection (CWE-78)
+
+**Taint Flow:**
+1. Entry: `args.command` from CLI arguments (line 264) or from YAML job file entries (lines 504-518 where `RunCommand` dispatches)
+2. When `args.shell` is True (settable as job setting), the command passes directly to `subprocess.call` with `shell=True` (line 277)
+3. Code: `return_code = subprocess.call(parsed_command, stdout=stdout, stderr=stderr, shell=args.shell)`
+
+**Why protections fail:** The `shell` option is explicitly supported and exposed as a configurable argument. No sanitization is applied to the command string before shell execution.
+
+**Exploitation (chained with VULN-19):** An attacker crafts a YAML job file with `type: external`, `shell: true`, and an arbitrary command string. Combined with the unsafe `yaml.load()` in VULN-19, the attacker achieves arbitrary OS command execution through two independent vectors: (1) YAML deserialization gadgets, or (2) the legitimate `ExternalCommand` execution path with `shell=True`.
+
+**Not a false positive because:** This is production CLI framework code. The `shell=True` option is explicitly supported. When invoked via `RunCommand` from a YAML job file, the command string comes from file content that may be untrusted.
 
 ---
 
