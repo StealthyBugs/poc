@@ -251,17 +251,57 @@ aws --profile ${AWS_PROFILE:-default} sts assume-role --role-arn ${1} \
 
 **Injection vector:** If `$1` contains `$(id)` or backticks, the shell interprets the command substitution *before* passing it to the AWS CLI. The `eval` wrapper compounds the risk by executing the output as shell code.
 
-### 6.2 `aws-samples/kubernetes-for-java-developers` — Unquoted `$EKS_KUBECTL_ROLE_ARN`
+### 6.2 The `$EKS_KUBECTL_ROLE_ARN` Anti-Pattern — Origin and Proliferation
 
-**Repo:** [aws-samples/kubernetes-for-java-developers/buildspec.yml](https://github.com/aws-samples/kubernetes-for-java-developers/blob/master/buildspec.yml)
+This is the most significant finding: an **unquoted role ARN variable** originating from the **official AWS EKS Workshop** that has been systematically copied across the ecosystem.
 
+**Origin:** [aws-samples/eks-workshop CloudFormation template](https://github.com/aws-samples/eks-workshop/blob/main/templates/ci-cd-codepipeline.cfn.yml)
+
+The CloudFormation template takes a user-supplied `KubectlRoleName` parameter, constructs an ARN via `!Sub`, and passes it as an environment variable to CodeBuild:
 ```yaml
-# buildspec.yml — post_build phase
+EKS_KUBECTL_ROLE_ARN:
+  Value: !Sub arn:aws:iam::${AWS::AccountId}:role/${KubectlRoleName}
+```
+
+The corresponding buildspec then uses this ARN **unquoted**:
+```bash
 CREDENTIALS=$(aws sts assume-role --role-arn $EKS_KUBECTL_ROLE_ARN \
   --role-session-name codebuild-kubectl --duration-seconds 900)
 ```
 
-The variable `$EKS_KUBECTL_ROLE_ARN` is **unquoted**. In a CodeBuild environment, if this environment variable contains shell metacharacters (from a role path like `/${injection}/`), word splitting and command substitution will occur.
+**Proliferation:** This pattern has been copied into at least these repos:
+
+| Repo | File |
+|------|------|
+| [aws-samples/kubernetes-for-java-developers](https://github.com/aws-samples/kubernetes-for-java-developers/blob/master/buildspec.yml) | `buildspec.yml` |
+| [rnzsgh/eks-workshop-sample-api-service-go](https://github.com/rnzsgh/eks-workshop-sample-api-service-go/blob/master/buildspec.yml) | `buildspec.yml` (official EKS Workshop sample) |
+| [aquasecurity/amazon-eks-devsecops](https://github.com/aquasecurity/amazon-eks-devsecops/blob/master/buildspec.yml) | `buildspec.yml` |
+| Multiple StackSimplify, Medium, and DEV Community tutorials | Various |
+
+**Injection vector:** If the role ARN contains `$(id)` in its path, the unquoted variable expansion causes the shell to execute `id` as a command substitution *before* passing the result to the AWS CLI. In CodeBuild, this executes with the CodeBuild service role's permissions.
+
+### 6.2a `aws-samples/amazon-eks-refarch-cloudformation` — Unquoted Makefile Variable
+
+**Repo:** [aws-samples/amazon-eks-refarch-cloudformation](https://github.com/aws-samples/amazon-eks-refarch-cloudformation)
+
+```makefile
+# Used in create-eks-cluster, update-eks-cluster, delete-eks-cluster targets
+@aws --region $(REGION) cloudformation delete-stack \
+  --role-arn $(EKS_ADMIN_ROLE) --stack-name "$(CLUSTER_STACK_NAME)"
+```
+
+While `$(...)` in Makefile context is Make variable expansion (not shell command substitution), if the resolved value contains shell metacharacters, they will be interpreted when the recipe line is executed by the shell.
+
+### 6.2b `aws-samples/sample-enable-eks-auto-mode-using-github-actions` — Unquoted `$ROLE_ARN` with eksctl
+
+**Repo:** [aws-samples/sample-enable-eks-auto-mode-using-github-actions](https://github.com/aws-samples/sample-enable-eks-auto-mode-using-github-actions)
+
+```bash
+eksctl delete iamidentitymapping \
+  --cluster $cluster --region $AWS_REGION --arn $ROLE_ARN
+```
+
+The `$ROLE_ARN` comes from GitHub secrets (`AWS_ROLE_ARN`) and is used unquoted in shell commands.
 
 ### 6.3 CVE-2025-5277: `alexei-led/aws-mcp-server` — Command Injection (CVSS 9.6)
 
