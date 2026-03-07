@@ -440,7 +440,122 @@ Key safety features: **quoted variables** (`"$ROLE"`), **no `eval`**, and creden
 
 ---
 
-## 7. Related Security Research
+## 7. Broader Attack Surface — Other AWS Identifiers in Shell Commands
+
+The role ARN injection patterns in Section 6 are part of a much larger class: **any AWS identifier with user-controlled characters that flows into a shell command without proper quoting**. This section catalogs other AWS value types that are vulnerable.
+
+### 7.1 SSM Parameter Store & Secrets Manager Values
+
+SSM Parameter values and Secrets Manager secrets are **arbitrary strings** — they can contain any character including `$()`, backticks, semicolons, pipes, and newlines. They are routinely fetched at runtime and interpolated into shell commands.
+
+#### 7.1a `aws-samples/aws-lambda-environmental-variables-from-aws-secrets-manager` — `eval`/`source` of Secret Values (CRITICAL)
+
+**Repo:** [aws-samples/aws-lambda-environmental-variables-from-aws-secrets-manager](https://github.com/aws-samples/aws-lambda-environmental-variables-from-aws-secrets-manager)
+**File:** `src/get-secrets-layer` (bash wrapper script)
+
+```bash
+echo "${values}" | while read -r line; do
+    ARRY=(${line//|/ })
+    key="${ARRY[0]}"
+    unset ARRY[0]
+    value="${ARRY[@]}"
+    echo "export ${key}=\"${value}\"" >> ${tempFile}
+done
+
+. ${tempFile}  # Sources the file — executes any embedded commands
+```
+
+The script retrieves secrets from AWS Secrets Manager, writes `export KEY="VALUE"` statements to a temp file, and **sources it**. If a secret value contains `"$(malicious_command)"`, the double-quote escaping is trivially broken and arbitrary commands execute during Lambda cold start. An attacker who can modify Secrets Manager values (e.g., via compromised IAM credentials) achieves RCE inside the Lambda function.
+
+#### 7.1b `aws-samples/aws-reinvent2018-keeping-secrets` — Unquoted MySQL Password (HIGH)
+
+**Repo:** [aws-samples/aws-reinvent2018-keeping-secrets](https://github.com/aws-samples/aws-reinvent2018-keeping-secrets/blob/master/keeping-secrets-wp-20181119.yaml)
+
+Presented at **re:Invent 2018 SEC353** as the recommended "keeping secrets" pattern:
+
+```bash
+secret=$(aws secretsmanager get-secret-value --secret-id ${WPDBSecretName} \
+    --region ${AWS::Region} | jq .SecretString | jq fromjson)
+user=$(echo $secret | jq -r .username)
+password=$(echo $secret | jq -r .password)
+
+mysql -p$password -u $user -P $port -h $endpoint
+```
+
+All variables are **unquoted**. The `mysql -p$password` pattern means shell metacharacters in the password are interpreted before `mysql` sees them. The `echo $secret` (without quotes) is subject to word splitting and globbing.
+
+#### 7.1c `aws-samples/aws-secretsmgr-workshop` — Same MySQL Pattern (HIGH)
+
+**Repo:** [aws-samples/aws-secretsmgr-workshop](https://github.com/aws-samples/aws-secretsmgr-workshop/blob/master/site/RDSFargate/RDSFargate.yml)
+
+Identical unquoted `mysql -p$password` pattern in a workshop CloudFormation template that participants deploy, further propagating the anti-pattern.
+
+#### 7.1d `aws-samples/sample-logistics-agent-agentcore-runtime` — Unquoted psql Credentials (MEDIUM-HIGH)
+
+**Repo:** [aws-samples/sample-logistics-agent-agentcore-runtime](https://github.com/aws-samples/sample-logistics-agent-agentcore-runtime)
+
+```bash
+DB_SECRET_ARN=$(aws ssm get-parameter --name /agentcore/rds/secret-arn \
+  --query 'Parameter.Value' --output text)
+DB_CREDENTIALS=$(aws secretsmanager get-secret-value \
+  --secret-id $DB_SECRET_ARN --query 'SecretString' --output text)
+DB_USERNAME=$(echo $DB_CREDENTIALS | jq -r '.username')
+DB_PASSWORD=$(echo $DB_CREDENTIALS | jq -r '.password')
+
+PGPASSWORD=$DB_PASSWORD psql -h $DB_ENDPOINT -U $DB_USERNAME -d company_logistics_db -f schema.sql
+```
+
+Multiple injection points: `$DB_SECRET_ARN` unquoted in `--secret-id`, `$DB_CREDENTIALS` echoed without quotes (word splitting), `PGPASSWORD=$DB_PASSWORD` unquoted on the `psql` command line.
+
+#### 7.1e `aws-samples/amazon-eks-jenkins-terraform` — Docker Login with Unquoted SSM Password (MEDIUM)
+
+**Repo:** [aws-samples/amazon-eks-jenkins-terraform](https://github.com/aws-samples/amazon-eks-jenkins-terraform/blob/master/buildspec.yml)
+
+```yaml
+env:
+  parameter-store:
+    LOGIN_PASSWORD: /CodeBuild/dockerLoginPassword
+phases:
+  pre_build:
+    commands:
+      - docker login -u $LOGIN_USER -p $LOGIN_PASSWORD
+```
+
+CodeBuild fetches SSM parameters as environment variables, then uses them **unquoted** in `docker login`. The safer pattern is `echo "$LOGIN_PASSWORD" | docker login --username "$LOGIN_USER" --password-stdin`.
+
+### 7.2 AWS Resource Tag Values
+
+Tag values allow nearly arbitrary Unicode characters (up to 256 chars), including `$`, backticks, `;`, `|`, `()`, spaces, and more. Tags are commonly read by automation scripts (user-data, Lambda, CI/CD) and used in shell commands.
+
+*Findings pending — research in progress.*
+
+### 7.3 S3 Object Keys
+
+S3 object keys can contain **almost any byte** including `$()`, backticks, semicolons, pipes, newlines, spaces, and quotes. The only real limits are 1024 bytes and UTF-8 encoding. S3 event-triggered Lambdas that pass the key to shell commands are a classic injection vector:
+
+```python
+# Dangerous pattern in S3-triggered Lambda
+key = event['Records'][0]['s3']['object']['key']
+subprocess.run(f"process_file s3://bucket/{key}", shell=True)  # RCE
+```
+
+*Additional findings pending — research in progress.*
+
+### 7.4 STS External IDs, Session Names & Other Identity Values
+
+| Identifier | Character Set | Max Length | Risk |
+|---|---|---|---|
+| **External ID** (`--external-id`) | Any string | 2-1224 chars | High — often from third parties |
+| **Role session name** | `[a-zA-Z0-9+=,.@-_]` | 64 chars | Low — limited charset |
+| **IAM usernames** | `[a-zA-Z0-9+=,.@-_]` + path `/` | 64 chars | Low-Medium |
+| **OIDC token claims** | Arbitrary (from IdP) | Varies | High — user-controlled strings |
+| **CloudFormation parameter values** | Arbitrary user input | 4096 chars | High — flows to UserData/custom resources |
+
+*Additional findings pending — research in progress.*
+
+---
+
+## 8. Related Security Research
 
 | Research | Relevance |
 |----------|-----------|
@@ -455,7 +570,7 @@ Key safety features: **quoted variables** (`"$ROLE"`), **no `eval`**, and creden
 
 ---
 
-## 8. Key Takeaways
+## 9. Key Takeaways
 
 1. **`$` cannot appear in IAM role names**, but **CAN appear in IAM role paths** per the API validation regex.
 2. This means an IAM role ARN can contain `$` in the path segment: `arn:aws:iam::ACCT:role/$path/RoleName`
