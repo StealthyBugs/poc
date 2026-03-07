@@ -298,13 +298,65 @@ This is referenced in:
 
 When the role ARN is sourced from an untrusted input (API response, config file, environment variable), and the `eval` pattern is used, a malicious role path containing `$(malicious-command)` will execute the injected command.
 
-### 6.6 `aws-actions/configure-aws-credentials` — Character Sanitization
+### 6.6 `aws/aws-cli` — `export-credentials --format env` with Unquoted `eval`
+
+**Repo:** [aws/aws-cli](https://github.com/aws/aws-cli)
+**Issues:** [#7388](https://github.com/aws/aws-cli/issues/7388), [#8187](https://github.com/aws/aws-cli/issues/8187), [#8284](https://github.com/aws/aws-cli/issues/8284)
+
+The officially documented pattern is:
+```bash
+eval $(aws configure export-credentials --profile dev --format env)
+```
+
+The `--format env` output was reported to produce **unquoted** values:
+```
+export AWS_ACCESS_KEY_ID=AKIAXXXXXXXX
+export AWS_SECRET_ACCESS_KEY=xxxxx
+export AWS_SESSION_TOKEN=xxxxx
+```
+
+Issue [#8187](https://github.com/aws/aws-cli/issues/8187) reported that unquoted values caused failures, and the reporter recommended quoting. Issue [#8284](https://github.com/aws/aws-cli/issues/8284) reported PowerShell format quoting bugs that corrupted session tokens containing `=`. The AWS CLI team acknowledged in [#4479](https://github.com/aws/aws-cli/issues/4479) that "printing commands that can be eval'd has in general been a painpoint."
+
+### 6.7 `aws/rolesanywhere-credential-helper` — Unquoted `${ROLE_ARN}` in README
+
+**Repo:** [aws/rolesanywhere-credential-helper](https://github.com/aws/rolesanywhere-credential-helper)
+
+The README demonstrates usage with **unquoted** variables:
+```bash
+/path/to/aws_signing_helper credential-process \
+ --certificate /path/to/certificate/file \
+ --private-key handle:${CHILD_HANDLE} \
+ --role-arn ${ROLE_ARN} \
+ --trust-anchor-arn ${TA_ARN} \
+ --profile-arn ${PROFILE_ARN}
+```
+
+All ARN variables (`${ROLE_ARN}`, `${TA_ARN}`, `${PROFILE_ARN}`) are unquoted. The `credential-process` output is consumed by the AWS SDK's `credential_process` feature, which could feed into further shell contexts. Additionally, the MacOS Keychain example uses an unquoted password variable:
+```bash
+security unlock-keychain -p ${CREDENTIAL_HELPER_KEYCHAIN_PASSWORD} credential-helper.keychain
+```
+
+### 6.8 `aws-ia/terraform-aws-control_tower_account_factory` — ARN Construction from Shell Variables
+
+**Repo:** [aws-ia/terraform-aws-control_tower_account_factory](https://github.com/aws-ia/terraform-aws-control_tower_account_factory)
+**Issue:** [#219](https://github.com/aws-ia/terraform-aws-control_tower_account_factory/issues/219)
+
+The `creds.sh` script constructs ARNs from shell variables:
+```bash
+CREDENTIALS=$(aws sts assume-role \
+  --role-arn "arn:${AWS_PARTITION}:iam::${AFT_MGMT_ACCOUNT}:role/${AFT_MGMT_ROLE}" \
+  --role-session-name "${ROLE_SESSION_NAME}")
+```
+
+While the outer variable is quoted, the ARN is built from multiple environment variables (`${AWS_PARTITION}`, `${AFT_MGMT_ACCOUNT}`, `${AFT_MGMT_ROLE}`) that could individually contain injection payloads. When `${AWS_PARTITION}` was unset, it produced malformed ARNs. In a multi-tenant environment, if any of these component variables are attacker-influenced, injection is possible within the quoted string via the component values themselves.
+
+### 6.9 `aws-actions/configure-aws-credentials` — Character Sanitization (Safe)
 
 **Repo:** [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)
 
-The GitHub Action sanitizes special characters in `GITHUB_ACTOR` and `GITHUB_WORKFLOW` when used in session tags (replacing invalid characters with `*`). However, the `role-to-assume` input parameter is passed directly to the AWS SDK, not through a shell — making it resistant to this class of injection. The Action also handles special characters in `AWS_SECRET_ACCESS_KEY` via a retry mechanism ([Issue #599](https://github.com/aws-actions/configure-aws-credentials/issues/599)).
+The GitHub Action sanitizes special characters in `GITHUB_ACTOR` and `GITHUB_WORKFLOW` when used in session tags (replacing invalid characters with `*`). The `role-to-assume` input parameter is passed directly to the AWS SDK, not through a shell — making it resistant to this class of injection. The Action also handles special characters in `AWS_SECRET_ACCESS_KEY` via a retry mechanism ([Issue #599](https://github.com/aws-actions/configure-aws-credentials/issues/599)).
 
-### 6.7 Safe Patterns (for contrast)
+### 6.10 Safe Patterns (for contrast)
 
 The official AWS sample repos generally use the safer pattern:
 ```bash
