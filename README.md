@@ -275,16 +275,44 @@ The fix introduced `validate_aws_command()` and `validate_pipe_command()` functi
 
 **Timeline:** Disclosed April 8, 2025. Partially fixed April 10. CVE published May 28, 2025.
 
-### 6.4 `aws/aws-parallelcluster-node` — Subprocess Injection Validators Added
+### 6.4 `aws/aws-parallelcluster-node` — Confirmed Subprocess Injection (Fixed v3.5.0)
 
-**Repo:** [aws/aws-parallelcluster-node CHANGELOG](https://github.com/aws/aws-parallelcluster-node/blob/develop/CHANGELOG.md)
+**Repo:** [aws/aws-parallelcluster-node](https://github.com/aws/aws-parallelcluster-node)
+**Vulnerable files:** `src/common/schedulers/slurm_commands.py`, `src/common/utils.py`
+**Fix commit:** `47012a17bd`
 
-Version 3.5.0 changelog entry:
-> "Add validators to prevent malicious string injection while calling the subprocess module."
+Prior to v3.5.0, `slurm_commands.py` constructed shell commands via **f-string formatting** and passed them to `subprocess` with **`shell=True`**, without sanitizing inputs. Vulnerable functions included:
 
-This Python package runs on EC2 instances and uses `subprocess` to execute Slurm scheduler commands (`scontrol`, etc.). The security fix added input validation to prevent injection through user-controllable strings passed to these commands — which could include role ARNs or paths in certain configurations.
+```python
+# update_nodes() — unsanitized reason, nodenames, state interpolated into shell command
+f'{SCONTROL} update nodename={nodenames} state={state} reason="{reason}"'
 
-### 6.5 Widespread `eval $(assume-role ...)` Community Pattern
+# update_partitions() — unsanitized partition and state
+f"{SCONTROL} update partitionname={partition} state={state}"
+
+# get_nodes_info() — nodes injected directly into piped shell command
+f'{SCONTROL} show nodes {nodes} | awk ...'
+```
+
+These commands ran with **sudo privileges** (clustermgtd runs as cluster admin). The fix added `validate_subprocess_argument()` which rejects `&`, `|`, `;`, `$`, `>`, `<`, backtick, `\`, `!`, `#`, and `\n` characters.
+
+While this specific case involved Slurm parameters rather than IAM role ARN paths, it demonstrates the **exact vulnerability class**: infrastructure identifiers with shell metacharacters flowing into subprocess calls with `shell=True`.
+
+### 6.5 `aws/aws-cdk` — `shell: true` in Cloud Assembly Execution
+
+**Repo:** [aws/aws-cdk](https://github.com/aws/aws-cdk)
+**File:** `packages/aws-cdk/lib/api/cxapp/exec.ts`
+
+The CDK CLI's `exec.ts` uses:
+```typescript
+childProcess.spawn(commandAndArgs, { shell: true, ... })
+```
+
+to execute the cloud assembly app command. While role ARNs passed via `--role-arn` are handled through the SDK (not shell), the use of `shell: true` with inherited process environment means any environment variable containing shell metacharacters would be expanded by the shell.
+
+Additionally, [aws/aws-cdk-cli Issue #1175](https://github.com/aws/aws-cdk-cli/issues/1175) reports that `cdk import --role-arn <ARN>` incorrectly interprets the ARN as a file path for `--record-resource-mapping`, meaning ARN strings are treated as filesystem paths — a logic confusion bug.
+
+### 6.6 Widespread `eval $(assume-role ...)` Community Pattern
 
 The extremely common pattern for assuming roles in shell scripts:
 ```bash
@@ -298,7 +326,7 @@ This is referenced in:
 
 When the role ARN is sourced from an untrusted input (API response, config file, environment variable), and the `eval` pattern is used, a malicious role path containing `$(malicious-command)` will execute the injected command.
 
-### 6.6 `aws/aws-cli` — `export-credentials --format env` with Unquoted `eval`
+### 6.7 `aws/aws-cli` — `export-credentials --format env` with Unquoted `eval`
 
 **Repo:** [aws/aws-cli](https://github.com/aws/aws-cli)
 **Issues:** [#7388](https://github.com/aws/aws-cli/issues/7388), [#8187](https://github.com/aws/aws-cli/issues/8187), [#8284](https://github.com/aws/aws-cli/issues/8284)
@@ -317,7 +345,7 @@ export AWS_SESSION_TOKEN=xxxxx
 
 Issue [#8187](https://github.com/aws/aws-cli/issues/8187) reported that unquoted values caused failures, and the reporter recommended quoting. Issue [#8284](https://github.com/aws/aws-cli/issues/8284) reported PowerShell format quoting bugs that corrupted session tokens containing `=`. The AWS CLI team acknowledged in [#4479](https://github.com/aws/aws-cli/issues/4479) that "printing commands that can be eval'd has in general been a painpoint."
 
-### 6.7 `aws/rolesanywhere-credential-helper` — Unquoted `${ROLE_ARN}` in README
+### 6.8 `aws/rolesanywhere-credential-helper` — Unquoted `${ROLE_ARN}` in README
 
 **Repo:** [aws/rolesanywhere-credential-helper](https://github.com/aws/rolesanywhere-credential-helper)
 
@@ -336,7 +364,7 @@ All ARN variables (`${ROLE_ARN}`, `${TA_ARN}`, `${PROFILE_ARN}`) are unquoted. T
 security unlock-keychain -p ${CREDENTIAL_HELPER_KEYCHAIN_PASSWORD} credential-helper.keychain
 ```
 
-### 6.8 `aws-ia/terraform-aws-control_tower_account_factory` — ARN Construction from Shell Variables
+### 6.9 `aws-ia/terraform-aws-control_tower_account_factory` — ARN Construction from Shell Variables
 
 **Repo:** [aws-ia/terraform-aws-control_tower_account_factory](https://github.com/aws-ia/terraform-aws-control_tower_account_factory)
 **Issue:** [#219](https://github.com/aws-ia/terraform-aws-control_tower_account_factory/issues/219)
@@ -350,13 +378,13 @@ CREDENTIALS=$(aws sts assume-role \
 
 While the outer variable is quoted, the ARN is built from multiple environment variables (`${AWS_PARTITION}`, `${AFT_MGMT_ACCOUNT}`, `${AFT_MGMT_ROLE}`) that could individually contain injection payloads. When `${AWS_PARTITION}` was unset, it produced malformed ARNs. In a multi-tenant environment, if any of these component variables are attacker-influenced, injection is possible within the quoted string via the component values themselves.
 
-### 6.9 `aws-actions/configure-aws-credentials` — Character Sanitization (Safe)
+### 6.10 `aws-actions/configure-aws-credentials` — Character Sanitization (Safe)
 
 **Repo:** [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)
 
 The GitHub Action sanitizes special characters in `GITHUB_ACTOR` and `GITHUB_WORKFLOW` when used in session tags (replacing invalid characters with `*`). The `role-to-assume` input parameter is passed directly to the AWS SDK, not through a shell — making it resistant to this class of injection. The Action also handles special characters in `AWS_SECRET_ACCESS_KEY` via a retry mechanism ([Issue #599](https://github.com/aws-actions/configure-aws-credentials/issues/599)).
 
-### 6.10 Safe Patterns (for contrast)
+### 6.11 Safe Patterns (for contrast)
 
 The official AWS sample repos generally use the safer pattern:
 ```bash
