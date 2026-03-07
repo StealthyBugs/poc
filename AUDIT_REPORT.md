@@ -8,10 +8,10 @@
 
 This report contains the results of a static-analysis security audit of 45 public repositories in the Capital One GitHub organization. Analysis focused exclusively on high and critical vulnerabilities reachable through HTTP requests and normal application interaction.
 
-**Total confirmed vulnerabilities: 23**
+**Total confirmed vulnerabilities: 25**
 - Critical: 3
-- High: 12
-- Medium-High: 8
+- High: 13
+- Medium-High: 9
 
 Each finding below survived multiple rounds of false-positive review, including verification that the code is not dead/test/mock, that no upstream guards neutralize the issue, and that a realistic attack path exists.
 
@@ -489,6 +489,51 @@ value = value
 
 ---
 
+### VULN-24: DOM XSS via Unsanitized HTML Concatenation in Chrome Extension
+- **Severity:** HIGH
+- **Repository:** acronym-decoder
+- **File:** `src/background.ts:54-88`
+- **Function:** `generateLookup()`
+- **Vulnerability Type:** Cross-Site Scripting (CWE-79)
+
+**Taint Flow:**
+1. Entry: User selects text on a web page, sent via `chrome.runtime.onMessage` (line 34)
+2. `data.query` and API response fields (`def.definition`, `link.name`, `link.link`) are concatenated into raw HTML strings
+3. Lines 54-81 build HTML without any escaping:
+   - `popupHTML += "<div><h3>" + data.query + "</h3></div>";`
+   - `popupHTML += "<li><p>"+def.definition+"</p>";`
+   - `popupHTML += "<a href="+link.link+" target=\"_blank\"...>";`
+4. The HTML is sent via `chrome.tabs.sendMessage` and injected into the active page DOM
+
+**Why protections fail:** No HTML escaping or sanitization is applied to any of the concatenated values. The `link.link` value is used in an `href` attribute without even quoting, enabling attribute injection without angle brackets.
+
+**Exploitation:** A compromised or malicious API server (at `config.lookupApiUrl`) returns a definition containing `<img src=x onerror=alert(document.cookie)>`. This payload executes in the context of whatever page the user has open, with full access to that page's DOM, cookies, and session. Because Chrome extensions run with elevated trust, this is particularly dangerous.
+
+**Not a false positive because:** No sanitization exists anywhere in the HTML construction chain. This is production extension code, not test code.
+
+---
+
+### VULN-25: SSRF via External `$ref` Resolution in OpenAPI Spec Loader
+- **Severity:** MEDIUM-HIGH
+- **Repository:** oas-nodegen
+- **File:** `lib/loader.js:130-163,222-255`
+- **Functions:** `Loader.prototype._load()`, `Loader.prototype._scanReferences()`
+- **Vulnerability Type:** Server-Side Request Forgery (CWE-918)
+
+**Taint Flow:**
+1. Entry: User supplies an OpenAPI specification document containing `$ref` values
+2. `_scanReferences()` (line 232) extracts `$ref` values; external references (not starting with `#`) are resolved
+3. Sink: `request(location, ...)` at line 133 fetches arbitrary URLs via the `request` library
+4. No URL validation, private IP blocking, or allowlisting is applied
+
+**Why protections fail:** The `resolvePath` function (line 77) resolves relative URLs but performs no security validation. Any URL scheme or destination is accepted.
+
+**Exploitation:** A malicious OpenAPI spec with `{ "$ref": "http://169.254.169.254/latest/meta-data/iam/security-credentials/" }` causes the loader to fetch AWS instance metadata, potentially exposing IAM credentials. Internal services on private networks can be probed via crafted `$ref` values pointing to `http://10.0.0.x/admin` or similar.
+
+**Not a false positive because:** The `_load` method makes unconstrained HTTP requests. The `$ref` mechanism is a core OpenAPI feature, and specs from untrusted sources are a realistic threat model for a code generator tool.
+
+---
+
 ## DISCARDED FINDINGS (False Positives After Review)
 
 The following were investigated and determined to NOT be exploitable:
@@ -531,7 +576,8 @@ The following were investigated and determined to NOT be exploitable:
 2. **Immediate:** Fix VULN-04 (hardcoded session secret) - rotate the secret and load from environment
 3. **Immediate:** Fix VULN-06 (arbitrary file write in WP plugin) - validate ini_path against an allowlist
 4. **High priority:** Fix all locopy SQL injection issues (VULN-10 through VULN-13) - use parameterized queries for identifiers
-5. **High priority:** Fix all XSS issues (VULN-01, 02, 03, 08, 17, 23) - use escaped output tags (`#{}` instead of `!{}` in Jade, `<%= %>` instead of `<%-` in EJS)
+5. **High priority:** Fix all XSS issues (VULN-01, 02, 03, 08, 17, 23, 24) - use escaped output tags (`#{}` instead of `!{}` in Jade, `<%= %>` instead of `<%-` in EJS), sanitize HTML in Chrome extensions
 6. **High priority:** Add authentication to exposed endpoints (VULN-15, 16, 21)
 7. **Medium priority:** Fix command injection in rubicon-ml (VULN-18) - use `subprocess.run` without `shell=True`
 8. **Medium priority:** Use `yaml.safe_load()` in giraffez (VULN-19)
+9. **Medium priority:** Add URL allowlisting/private IP blocking for `$ref` resolution in oas-nodegen (VULN-25)
