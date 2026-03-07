@@ -226,10 +226,105 @@ The API-level regex is the authoritative source since it governs server-side val
 
 ---
 
-## 6. Related Security Research
+## 6. Shell/Command Injection via Role Paths in AWS GitHub Repos
+
+IAM role paths can contain shell metacharacters like `$`, backticks, `{`, `}`, `(`, `)`, `;`, `|`, etc. If a role ARN with a malicious path (e.g., containing `$(id)`) is passed unsafely to shell commands, **OS command injection** occurs. The following patterns were identified across AWS's GitHub repositories:
+
+### 6.1 `awslabs/awscli-aliases` — PR #25: `eval` with Unquoted Role ARN
+
+**Repo:** [awslabs/awscli-aliases PR #25](https://github.com/awslabs/awscli-aliases/pull/25/files)
+
+The PR adds a `switch-role` alias designed to be used as:
+```bash
+eval $(aws switch-role $1)
+```
+
+The alias itself uses unquoted `${1}` for the role ARN:
+```bash
+switch-role = !f() {
+aws --profile ${AWS_PROFILE:-default} sts assume-role --role-arn ${1} \
+  --role-session-name "${USER}@${HOSTNAME}" \
+  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text | \
+(read KEY SECRET TOKEN; echo "export AWS_ACCESS_KEY_ID=\"$KEY\"; ...")
+}; f
+```
+
+**Injection vector:** If `$1` contains `$(id)` or backticks, the shell interprets the command substitution *before* passing it to the AWS CLI. The `eval` wrapper compounds the risk by executing the output as shell code.
+
+### 6.2 `aws-samples/kubernetes-for-java-developers` — Unquoted `$EKS_KUBECTL_ROLE_ARN`
+
+**Repo:** [aws-samples/kubernetes-for-java-developers/buildspec.yml](https://github.com/aws-samples/kubernetes-for-java-developers/blob/master/buildspec.yml)
+
+```yaml
+# buildspec.yml — post_build phase
+CREDENTIALS=$(aws sts assume-role --role-arn $EKS_KUBECTL_ROLE_ARN \
+  --role-session-name codebuild-kubectl --duration-seconds 900)
+```
+
+The variable `$EKS_KUBECTL_ROLE_ARN` is **unquoted**. In a CodeBuild environment, if this environment variable contains shell metacharacters (from a role path like `/${injection}/`), word splitting and command substitution will occur.
+
+### 6.3 CVE-2025-5277: `alexei-led/aws-mcp-server` — Command Injection (CVSS 9.6)
+
+**Repo:** [alexei-led/aws-mcp-server](https://github.com/alexei-led/aws-mcp-server)
+**Advisory:** [GHSA-m4qw-j7mx-qv6h](https://github.com/advisories/GHSA-m4qw-j7mx-qv6h)
+**Fix Commit:** [94d20ae](https://github.com/alexei-led/aws-mcp-server/commit/94d20ae1798a43ac7e3a28e71900d774e5159c8a)
+
+The `cli_executor.py` module executed AWS CLI commands without proper input sanitization. Shell metacharacters (`;`, `|`, `&&`, `||`, `` ` ``, `$()`) in MCP request parameters — including role ARNs — were interpreted by the shell.
+
+The fix introduced `validate_aws_command()` and `validate_pipe_command()` functions to sanitize input before execution.
+
+**Timeline:** Disclosed April 8, 2025. Partially fixed April 10. CVE published May 28, 2025.
+
+### 6.4 `aws/aws-parallelcluster-node` — Subprocess Injection Validators Added
+
+**Repo:** [aws/aws-parallelcluster-node CHANGELOG](https://github.com/aws/aws-parallelcluster-node/blob/develop/CHANGELOG.md)
+
+Version 3.5.0 changelog entry:
+> "Add validators to prevent malicious string injection while calling the subprocess module."
+
+This Python package runs on EC2 instances and uses `subprocess` to execute Slurm scheduler commands (`scontrol`, etc.). The security fix added input validation to prevent injection through user-controllable strings passed to these commands — which could include role ARNs or paths in certain configurations.
+
+### 6.5 Widespread `eval $(assume-role ...)` Community Pattern
+
+The extremely common pattern for assuming roles in shell scripts:
+```bash
+eval $(aws sts assume-role --role-arn "$ROLE_ARN" ... | jq -r '...')
+```
+
+This is referenced in:
+- [remind101/assume-role](https://github.com/remind101/assume-role) — `eval $(assume-role prod)`
+- [AWS CLI Issue #7546](https://github.com/aws/aws-cli/issues/7546) — Feature request for `aws sts assume-role` to output shell-compatible variable definitions
+- Multiple community gists and blog posts
+
+When the role ARN is sourced from an untrusted input (API response, config file, environment variable), and the `eval` pattern is used, a malicious role path containing `$(malicious-command)` will execute the injected command.
+
+### 6.6 `aws-actions/configure-aws-credentials` — Character Sanitization
+
+**Repo:** [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)
+
+The GitHub Action sanitizes special characters in `GITHUB_ACTOR` and `GITHUB_WORKFLOW` when used in session tags (replacing invalid characters with `*`). However, the `role-to-assume` input parameter is passed directly to the AWS SDK, not through a shell — making it resistant to this class of injection. The Action also handles special characters in `AWS_SECRET_ACCESS_KEY` via a retry mechanism ([Issue #599](https://github.com/aws-actions/configure-aws-credentials/issues/599)).
+
+### 6.7 Safe Patterns (for contrast)
+
+The official AWS sample repos generally use the safer pattern:
+```bash
+# aws-samples/cicd-lambda-container/assume-role.sh
+cred=$(aws sts assume-role --role-arn "$ROLE" \
+  --role-session-name "$SESSION_NAME" \
+  --query '[Credentials.AccessKeyId,Credentials.SecretAccessKey,Credentials.SessionToken]' \
+  --output text)
+export AWS_ACCESS_KEY_ID=$(echo "$cred" | awk '{ print $1 }')
+```
+
+Key safety features: **quoted variables** (`"$ROLE"`), **no `eval`**, and credentials parsed via `awk` rather than shell execution.
+
+---
+
+## 7. Related Security Research
 
 | Research | Relevance |
 |----------|-----------|
+| **CVE-2025-5277** (aws-mcp-server) | Critical (CVSS 9.6) command injection in AWS MCP server's `cli_executor.py`. Shell metacharacters in parameters executed as commands. |
 | **Stedi STS Bug** | `${...}` variable substitution in trust policies caused incorrect policy evaluation. AWS patched this. |
 | **whoAMI Attack** (Datadog, Feb 2025) | Resource name confusion attack causing RCE. Demonstrates naming edge cases are actively exploited. |
 | **Rhino Security Labs** | 21+ IAM privilege escalation methods, focused on permission misconfigs. |
@@ -240,7 +335,7 @@ The API-level regex is the authoritative source since it governs server-side val
 
 ---
 
-## 7. Key Takeaways
+## 8. Key Takeaways
 
 1. **`$` cannot appear in IAM role names**, but **CAN appear in IAM role paths** per the API validation regex.
 2. This means an IAM role ARN can contain `$` in the path segment: `arn:aws:iam::ACCT:role/$path/RoleName`
