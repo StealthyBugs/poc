@@ -635,7 +635,34 @@ subprocess.run(f"process_file s3://bucket/{key}", shell=True)  # RCE
 | **OIDC token claims** | Arbitrary (from IdP) | Varies | High — user-controlled strings |
 | **CloudFormation parameter values** | Arbitrary user input | 4096 chars | High — flows to UserData/custom resources |
 
-*Additional findings pending — research in progress.*
+Notable: **no official AWS sample repos use `--external-id` in shell scripts at all**. The `aws-doc-sdk-examples` bash `sts_assume_role()` function only accepts session name and role ARN — external ID is entirely absent. However, external IDs can be any string 2-1224 chars with no character restrictions, so any script that passes one to a shell command without quoting would be vulnerable.
+
+#### 7.4a CloudFormation Parameter Values in UserData — Structural Risk (MEDIUM-HIGH)
+
+CloudFormation templates commonly use `!Sub` to interpolate parameters into UserData bash scripts:
+
+```yaml
+UserData:
+  Fn::Base64: !Sub |
+    #!/bin/bash
+    echo "Setting up ${DatabaseName}"
+    mysql -u admin -p${DatabasePassword} ...
+```
+
+If `DatabaseName` or `DatabasePassword` are `String` type parameters **without `AllowedPattern` or `AllowedValues` constraints**, a user supplying the parameter could inject arbitrary bash commands. AWS pseudo-parameters (`AWS::StackName`, `AWS::Region`) are safe as they are AWS-controlled. Rhino Security Labs documented a related attack where CloudFormation templates are [modified in-transit on S3 before deployment](https://rhinosecuritylabs.com/aws/cloud-malware-cloudformation-injection/).
+
+#### 7.4b `aws/aws-app-mesh-examples` — Confirmed Unquoted Variables (Fixed)
+
+**Issue:** [aws/aws-app-mesh-examples #46](https://github.com/aws/aws-app-mesh-examples/issues/46) "Unquoted variables in bash scripts"
+**Fix:** [PR #48](https://github.com/aws/aws-app-mesh-examples/pull/48)
+
+Unquoted bash variables across the project's shell scripts were identified and fixed. Demonstrates this vulnerability class is recognized but only addressed reactively.
+
+#### 7.4c Account Name/Alias Character Validation Mismatch
+
+**Repo:** [awslabs/aws-deployment-framework](https://github.com/awslabs/aws-deployment-framework/issues/260)
+
+Account **names** allow Unicode and spaces (`[\u0020-\u007E]+`) while account **aliases** require `^[a-z0-9](([a-z0-9]|-(?!-))*[a-z0-9])?$`. When ADF code attempts to set account name as alias without validation, it fails for names with special characters. Not a shell injection vector, but demonstrates the pattern of identity values exceeding expected character sets across AWS services.
 
 ---
 
