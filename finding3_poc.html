@@ -48,7 +48,7 @@ function firePayloads(w) {
 
   // Step 1: Create a new chat tab
   targets.forEach(function(t) {
-    t.postMessage({ command: 'aws/chat/createTab', params: { tabId: tabId } }, '*');
+    t.postMessage({ command: 'aws/chat/tabAdd', params: { tabId: tabId, restoredTab: false } }, '*');
   });
   status('Created chat tab: ' + tabId, 'ok');
 
