@@ -103,23 +103,25 @@
 
 ---
 
-### Finding 6: Reflected DOM XSS in Rsvg-2.0 Documentation Search
+### ~~Finding 6: Reflected DOM XSS in Rsvg-2.0 Documentation Search~~ — DOWNGRADED TO LOW/INFORMATIONAL
+
+> **Re-analysis (2026-03-09):** The XSS pattern in the code is technically real (unsanitized `query` → `innerHTML`), but **NOT exploitable in SageMaker** because these documentation files are not served via HTTP by any web server. They are GNOME librsvg conda package documentation files sitting at `/opt/conda/share/doc/Rsvg-2.0/` on the filesystem, outside JupyterLab's file serving root. No HTTP route exists to these files in the default SageMaker configuration. Even if opened via `file://`, there is no same-origin context with JupyterLab for cookie/session theft. This is third-party code (gi-docgen template), not SageMaker-specific. **Severity: LOW/INFORMATIONAL — no practical exploit path in SageMaker.**
 
 | Field | Detail |
 |---|---|
 | **Title** | URL query parameter `q` reflected unsanitized into `innerHTML` via `renderResults()` |
 | **XSS Type** | DOM XSS (Reflected) |
-| **Severity** | MEDIUM |
+| **Severity** | ~~MEDIUM~~ → **LOW/INFORMATIONAL** (not HTTP-accessible in SageMaker) |
 | **File(s)** | `opt/conda/share/doc/Rsvg-2.0/search.js` (line 189 → innerHTML at line 224) |
 | **Source** | `window.location.search` parameter `q`, decoded via `decodeURIComponent()` |
 | **Sink** | `refs.search.innerHTML = renderResults(query, results)` |
 | **Sanitization** | None. The query string is concatenated directly into HTML: `"<h1>Results for &quot;" + query + "&quot;..."` |
 | **Why defense fails** | No HTML encoding is applied to `query`. The `&quot;` entities around it are decorative and do not prevent tag injection. |
-| **Exploit path** | 1. Attacker sends victim a link: `https://sagemaker-host/.../Rsvg-2.0/search.html?q=<img src=x onerror=alert(document.cookie)>`. 2. The search page loads, decodes the query, and injects it into `innerHTML`. 3. The `onerror` handler fires. |
-| **PoC** | URL: `search.html?q=<img/src=x onerror=alert(1)>` |
-| **Browser viability** | All modern browsers |
-| **Preconditions** | Documentation must be served via HTTP/HTTPS (common for local doc servers). User must click a crafted link. |
-| **Remediation** | HTML-encode the `query` variable before interpolation: replace `<`, `>`, `&`, `"`, `'` with HTML entities. |
+| **Exploit path** | **NOT EXPLOITABLE IN SAGEMAKER.** The documentation files at `/opt/conda/share/doc/Rsvg-2.0/` are not served by any HTTP server in SageMaker. JupyterLab only serves files under the notebook root (e.g., `/home/ec2-user/SageMaker/`). No Tornado handler or server extension routes to conda documentation files. There is no URL an attacker can craft to reach this page. |
+| **PoC** | N/A — not HTTP-accessible in SageMaker deployment |
+| **Browser viability** | All modern browsers (if file were HTTP-served) |
+| **Preconditions** | Documentation would need to be served via HTTP/HTTPS at a reachable URL — **this does not occur in default SageMaker configurations** |
+| **Remediation** | Upstream fix in gi-docgen: HTML-encode the `query` variable before interpolation. Low priority for SageMaker since files aren't served. |
 
 ---
 
@@ -322,13 +324,14 @@
 
 | Category | Count |
 |---|---|
-| **Confirmed Exploitable XSS** | **11** |
+| **Confirmed Exploitable XSS** | **10** |
 | Critical severity | 1 |
-| High severity | 2 |
-| Medium-High severity | 1 |
-| Medium severity | 4 |
+| High severity | 1 |
+| Medium-High severity | 2 |
+| Medium severity | 3 |
 | Low-Medium severity | 2 |
 | Medium (architectural/by-design) | 1 |
+| Downgraded to LOW/INFORMATIONAL | 1 (Finding 6 — not HTTP-accessible) |
 | Rejected false positives | 18 |
 | Directories reviewed | 15+ top-level areas |
 | Parallel review agents used | 20 |
